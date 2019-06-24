@@ -1,9 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 from collections import OrderedDict
 from configparser import ConfigParser
 from contextlib import contextmanager
 import csv
+import math
 import os
 from pathlib import Path
 import pickle
@@ -26,14 +27,14 @@ class Configure:
     qm = {
         'theory': 'B3LYP',              # Theory to use in freq and dihedral scans recommended e.g. wB97XD or B3LYP
         'basis': '6-311++G(d,p)',       # Basis set
-        'vib_scaling': '0.991',         # Associated scaling to the theory
-        'threads': '6',                 # Number of processors used in Gaussian09; affects the bonds and dihedral scans
+        'vib_scaling': '0.967',         # Associated scaling to the theory
+        'threads': '2',                 # Number of processors used in Gaussian09; affects the bonds and dihedral scans
         'memory': '2',                  # Amount of memory (in GB); specified in the Gaussian09 scripts
         'convergence': 'GAU_TIGHT',     # Criterion used during optimisations; works using PSI4, GeomeTRIC and G09
         'iterations': '350',            # Max number of optimisation iterations
         'bonds_engine': 'psi4',         # Engine used for bonds calculations
         'density_engine': 'onetep',     # Engine used to calculate the electron density
-        'charges_engine': 'chargemol',  # Engine used for charge partitioning
+        'charges_engine': 'onetep',  # Engine used for charge partitioning
         'ddec_version': '6',            # DDEC version used by Chargemol, 6 recommended but 3 is also available
         'geometric': 'True',            # Use GeomeTRIC for optimised structure (if False, will just use PSI4)
         'solvent': 'True',              # Use a solvent in the PSI4/Gaussian09 input
@@ -48,7 +49,7 @@ class Configure:
         'refinement_method': 'SP',      # The type of QUBE refinement that should be done SP: single point energies
         'tor_limit': '20',              # Torsion Vn limit to speed up fitting
         'div_index': '0',               # Fitting starting index in the division array
-        'parameter_engine': 'openff',   # Method used for initial parametrisation
+        'parameter_engine': 'xml',   # Method used for initial parametrisation
         'l_pen': '0.0',                 # The regularisation penalty
     }
 
@@ -63,7 +64,7 @@ class Configure:
         'vib_scaling': ';Associated scaling to the theory',
         'threads': ';Number of processors used in g09; affects the bonds and dihedral scans',
         'memory': ';Amount of memory (in GB); specified in the g09 and PSI4 scripts',
-        'convergence': ';Criterion used during optimisations; works using psi4 and geometric',
+        'convergence': ';Criterion used during optimisations; GAU, GAU_TIGHT, GAU_VERYTIGHT',
         'iterations': ';Max number of optimisation iterations',
         'bonds_engine': ';Engine used for bonds calculations',
         'density_engine': ';Engine used to calculate the electron density',
@@ -232,20 +233,20 @@ def mol_data_from_csv(csv_name):
 
         mol_confs = csv.DictReader(csv_file)
 
-    rows = []
-    for row in mol_confs:
+        rows = []
+        for row in mol_confs:
 
-        # Converts to ordinary dict rather than ordered.
-        row = dict(row)
-        # If there is no config given assume its the default
-        row['charge'] = int(float(row['charge'])) if row['charge'] else 0
-        row['multiplicity'] = int(float(row['multiplicity'])) if row['multiplicity'] else 1
-        row['config'] = row['config'] if row['config'] else 'default_config'
-        row['smiles'] = row['smiles'] if row['smiles'] else None
-        row['torsion_order'] = row['torsion_order'] if row['torsion_order'] else None
-        row['restart'] = row['restart'] if row['restart'] else 'parametrise'
-        row['end'] = row['end'] if row['end'] else 'finalise'
-        rows.append(row)
+            # Converts to ordinary dict rather than ordered.
+            row = dict(row)
+            # If there is no config given assume its the default
+            row['charge'] = int(float(row['charge'])) if row['charge'] else 0
+            row['multiplicity'] = int(float(row['multiplicity'])) if row['multiplicity'] else 1
+            row['config'] = row['config'] if row['config'] else 'default_config'
+            row['smiles'] = row['smiles'] if row['smiles'] else None
+            row['torsion_order'] = row['torsion_order'] if row['torsion_order'] else None
+            row['restart'] = row['restart'] if row['restart'] else None
+            row['end'] = row['end'] if row['end'] else 'finalise'
+            rows.append(row)
 
     # Creates the nested dictionaries with the names as the keys
     final = {row['name']: row for row in rows}
@@ -259,10 +260,13 @@ def mol_data_from_csv(csv_name):
     return final
 
 
-def generate_bulk_csv(csv_name):
+def generate_bulk_csv(csv_name, max_execs=None):
     """
     Generates a csv with name "csv_name" with minimal information inside.
     Contains only headers and a row of defaults and populates all of the named files where available.
+    max_execs determines the max number of executions per csv file.
+    For example, 10 pdb files with a value of max_execs=6 will generate two csv files,
+    one containing 6 of those files, the other with the remaining 4.
     """
 
     if csv_name[-4:] != '.csv':
@@ -274,14 +278,36 @@ def generate_bulk_csv(csv_name):
         if file.endswith('.pdb'):
             files.append(file[:-4])
 
-    with open(csv_name, 'w') as csv_file:
+    # If max number of pdbs per file is unspecified, just put them all in one file.
+    if max_execs is None:
+        with open(csv_name, 'w') as csv_file:
 
-        file_writer = csv.writer(csv_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
-        file_writer.writerow(['name', 'charge', 'multiplicity', 'config', 'smiles', 'torsion_order', 'restart', 'end'])
-        for file in files:
-            file_writer.writerow([file, 0, 1, '', '', '', '', ''])
+            file_writer = csv.writer(csv_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            file_writer.writerow(['name', 'charge', 'multiplicity', 'config', 'smiles', 'torsion_order', 'restart', 'end'])
+            for file in files:
+                file_writer.writerow([file, 0, 1, '', '', '', '', ''])
+        print(f'{csv_name} generated.', flush=True)
+        return
 
-    print(f'{csv_name} generated.', flush=True)
+    try:
+        max_execs = int(max_execs)
+    except TypeError:
+        raise TypeError('Number of executions must be provided as an int greater than 1.')
+    if max_execs > len(files):
+        raise ValueError('Number of executions cannot exceed the number of files provided.')
+
+    # If max number of pdbs per file is specified, spread them across several csv files.
+    num_csvs = math.ceil(len(files) / max_execs)
+
+    for csv_count in range(num_csvs):
+        with open(f'{csv_name[:-4]}_{str(csv_count).zfill(2)}.csv', 'w') as csv_file:
+            file_writer = csv.writer(csv_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            file_writer.writerow(['name', 'charge', 'multiplicity', 'config', 'smiles', 'torsion_order', 'restart', 'end'])
+
+            for file in files[csv_count * max_execs: (csv_count + 1) * max_execs]:
+                file_writer.writerow([file, 0, 1, '', '', '', '', ''])
+
+        print(f'{csv_name[:-4]}_{str(csv_count).zfill(2)}.csv generated.', flush=True)
 
 
 def append_to_log(message, msg_type='major'):
@@ -290,10 +316,17 @@ def append_to_log(message, msg_type='major'):
     Used for significant stages in the program such as when a stage has finished.
     """
 
-    if 'QUBEKit_log.txt' in os.listdir('.'):
-        log_file = 'QUBEKit_log.txt'
-    else:
-        log_file = '../QUBEKit_log.txt'
+    # Starting in the current directory walk back looking for the log file
+    # Stop at the first file found this should be our file
+    search_dir = os.getcwd()
+    while True:
+        if 'QUBEKit_log.txt' in os.listdir(search_dir):
+            log_file = os.path.abspath(os.path.join(search_dir, 'QUBEKit_log.txt'))
+            break
+
+        # Else we have to split the search path
+        else:
+            search_dir = os.path.split(search_dir)[0]
 
     # Check if the message is a blank string to avoid adding blank lines and unnecessary separators
     if message:
@@ -358,16 +391,20 @@ def pretty_progress():
     end = '\033[0m'
 
     # Bold colours
-    colours = {'red': '\033[1;31m',
-               'green': '\033[1;32m',
-               'orange': '\033[1;33m',
-               'blue': '\033[1;34m'}
+    colours = {
+        'red': '\033[1;31m',
+        'green': '\033[1;32m',
+        'orange': '\033[1;33m',
+        'blue': '\033[1;34m',
+        'purple': '\033[1;35m'
+    }
 
     print('Displaying progress of all analyses in current directory.')
     print(f'Progress key: {colours["green"]}\u2713{end} = Done;', end=' ')
     print(f'{colours["blue"]}S{end} = Skipped;', end=' ')
     print(f'{colours["red"]}E{end} = Error;', end=' ')
-    print(f'{colours["orange"]}~{end} = Queued')
+    print(f'{colours["orange"]}R{end} = Running;', end=' ')
+    print(f'{colours["purple"]}~{end} = Queued')
 
     header_string = '{:15}' + '{:>10}' * 10
     print(header_string.format(
@@ -392,8 +429,11 @@ def pretty_progress():
             elif var_in == 'E':
                 print(f'{colours["red"]}{var_in:>9}{end}', end=' ')
 
-            elif var_in == '~':
+            elif var_in == 'R':
                 print(f'{colours["orange"]}{var_in:>9}{end}', end=' ')
+
+            elif var_in == '~':
+                print(f'{colours["purple"]}{var_in:>9}{end}', end=' ')
 
         print('')
 
@@ -409,17 +449,19 @@ def populate_progress_dict(file_name):
     """
 
     # Indicators in the log file which show a stage has completed
-    search_terms = ['PARAMETRISE', 'MM_OPT', 'QM_OPT', 'HESSIAN', 'MOD_SEM', 'DENSITY', 'CHARGE', 'LENNARD',
+    search_terms = ['PARAMETRISATION', 'MM_OPT', 'QM_OPT', 'HESSIAN', 'MOD_SEM', 'DENSITY', 'CHARGE', 'LENNARD',
                     'TORSION_S', 'TORSION_O']
 
     progress = OrderedDict((k, '~') for k in search_terms)
+
+    restart_log = False
 
     with open(file_name, 'r') as file:
         for line in file:
 
             # Reset progress when restarting (set all progress to incomplete)
             if 'Continuing log file' in line:
-                progress = OrderedDict((k, '~') for k in search_terms)
+                restart_log = True
 
             # Look for the specific search terms
             for term in search_terms:
@@ -427,8 +469,11 @@ def populate_progress_dict(file_name):
                     # If you find a search term, check if it's skipped (S)
                     if 'SKIP' in line:
                         progress[term] = 'S'
-                    # If it's found and not skipped, it must be done (tick)
-                    else:
+                    # If we have restarted then we need to
+                    elif 'STARTING' in line:
+                        progress[term] = 'R'
+                    # If its finishing tag is present it is done (tick)
+                    elif 'FINISHING' in line:
                         progress[term] = u'\u2713'
                     last_success = term
 
@@ -442,8 +487,18 @@ def populate_progress_dict(file_name):
                     term = search_terms[search_terms.index(last_success)]
                 # If errored immediately, then last_success won't have been defined yet
                 except UnboundLocalError:
-                    term = 'PARAMETRISE'
+                    term = 'PARAMETRISATION'
                 progress[term] = 'E'
+
+    # Now we need to check if there was a restart and clear the progress of everything after the running step
+    if restart_log:
+        for term, stage in progress.items():
+            if stage == 'R':
+                restart_term = search_terms.index(term)
+                break
+
+        for term in search_terms[restart_term + 1:]:
+            progress[term] = '~'
 
     return progress
 
@@ -535,7 +590,8 @@ def check_net_charge(charges, ideal_net=0, error=0.00001):
     total_charge = sum(atom for atom in charges)
 
     with assert_wrapper(ValueError):
-        assert (abs(total_charge - ideal_net) < error), 'Total charge is not close enough to desired integer value in configs.'
+        assert (abs(total_charge - ideal_net) < error), ('Total charge is not close enough to desired '
+                                                         'integer value in configs.')
 
     print(f'Charge check successful. Net charge is within {error} of the desired net charge of {ideal_net}.')
     return True
