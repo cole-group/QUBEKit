@@ -4,6 +4,7 @@ from collections import OrderedDict
 from configparser import ConfigParser
 from contextlib import contextmanager
 import csv
+from functools import partial
 import math
 import os
 from pathlib import Path
@@ -53,6 +54,15 @@ class Configure:
         'l_pen': '0.0',                 # The regularisation penalty
     }
 
+    excited = {
+        'excited_state': 'False',      # Is this an excited state calculation
+        'excited_theory': 'TDA',
+        'nstates': '3',
+        'excited_root': '1',
+        'use_pseudo': 'False',
+        'pseudo_potential_block': ''
+    }
+
     descriptions = {
         'chargemol': '/home/<QUBEKit_user>/chargemol_09_26_2017',  # Location of the chargemol program directory
         'log': '999',                   # Default string for the working directories and logs
@@ -83,7 +93,13 @@ class Configure:
         'div_index': ';Fitting starting index in the division array',
         'parameter_engine': ';Method used for initial parametrisation',
         'chargemol': ';Location of the Chargemol program directory (do not end with a "/")',
-        'log': ';Default string for the names of the working directories'
+        'log': ';Default string for the names of the working directories',
+        'excited_state': ';Use the excited state',
+        'excited_theory': ';Excited state theory TDA or TD',
+        'nstates': ';The number of states to use',
+        'excited_root': ';The root',
+        'use_pseudo': ';Use a pseudo potential',
+        'pseudo_potential_block': ';Enter the pseudo potential block here eg'
     }
 
     # TODO Why is this static? Shouldn't we just use self.qm, self.fitting etc
@@ -97,23 +113,23 @@ class Configure:
 
             # Check if the user has made a new master file to use
             if Configure.check_master():
-                qm, fitting, descriptions = Configure.ini_parser(f'{Configure.config_folder + Configure.master_file}')
+                qm, fitting, excited, descriptions = Configure.ini_parser(f'{Configure.config_folder + Configure.master_file}')
 
             else:
                 # If there is no master then assign the default config
-                qm, fitting, descriptions = Configure.qm, Configure.fitting, Configure.descriptions
+                qm, fitting, excited, descriptions = Configure.qm, Configure.fitting, Configure.excited, Configure.descriptions
 
         else:
             # Load in the ini file given
             if os.path.exists(config_file):
-                qm, fitting, descriptions = Configure.ini_parser(config_file)
+                qm, fitting, excited, descriptions = Configure.ini_parser(config_file)
 
             else:
-                qm, fitting, descriptions = Configure.ini_parser(Configure.config_folder + config_file)
+                qm, fitting, excited, descriptions = Configure.ini_parser(Configure.config_folder + config_file)
 
         # Now cast the numbers
         clean_ints = ['threads', 'memory', 'iterations', 'ddec_version', 'dih_start',
-                      'increment', 'dih_end', 'tor_limit', 'div_index']
+                      'increment', 'dih_end', 'tor_limit', 'div_index', 'nstates', 'excited_root']
 
         for key in clean_ints:
 
@@ -122,6 +138,9 @@ class Configure:
 
             elif key in fitting:
                 fitting[key] = int(fitting[key])
+
+            elif key in excited:
+                excited[key] = int(excited[key])
 
         # Now cast the one float the scaling
         qm['vib_scaling'] = float(qm['vib_scaling'])
@@ -133,6 +152,8 @@ class Configure:
         #  config parsing begins in run.py
         qm['geometric'] = True if qm['geometric'].lower() == 'true' else False
         qm['solvent'] = True if qm['solvent'].lower() == 'true' else False
+        excited['excited_state'] = True if excited['excited_state'].lower() == 'true' else False
+        excited['use_pseudo'] = True if excited['use_pseudo'].lower() == 'true' else False
 
         # Now handle the weight temp
         if fitting['t_weight'] != 'infinity':
@@ -143,7 +164,7 @@ class Configure:
 
         # return qm, fitting, descriptions
         # TODO Fix this monstrosity; shouldn't need to cast to dict() but something must be broken
-        return {**dict(qm), **dict(fitting), **dict(descriptions)}
+        return {**dict(qm), **dict(fitting), **dict(excited), **dict(descriptions)}
 
     @staticmethod
     def ini_parser(ini):
@@ -153,15 +174,16 @@ class Configure:
         config.read(ini)
         qm = config.__dict__['_sections']['QM']
         fitting = config.__dict__['_sections']['FITTING']
+        excited = config.__dict__['_sections']['EXCITED']
         descriptions = config.__dict__['_sections']['DESCRIPTIONS']
 
-        return qm, fitting, descriptions
+        return qm, fitting, excited, descriptions
 
     @staticmethod
     def show_ini():
         """Show all of the ini file options in the config folder."""
 
-        inis = os.listdir(Configure.config_folder)
+        inis = [ini for ini in os.listdir(Configure.config_folder) if not ini.endswith('~')]  # Hide the emacs backups
 
         return inis
 
@@ -182,11 +204,11 @@ class Configure:
         # Check the current master template
         if Configure.check_master():
             # If master then load
-            qm, fitting, descriptions = Configure.ini_parser(Configure.config_folder + Configure.master_file)
+            qm, fitting, excited, descriptions = Configure.ini_parser(Configure.config_folder + Configure.master_file)
 
         else:
             # If default is the config file then assign the defaults
-            qm, fitting, descriptions = Configure.qm, Configure.fitting, Configure.descriptions
+            qm, fitting, excited, descriptions = Configure.qm, Configure.fitting, Configure.excited, Configure.descriptions
 
         # Set config parser to allow for comments
         config = ConfigParser(allow_no_value=True)
@@ -201,6 +223,12 @@ class Configure:
         for key, val in fitting.items():
             config.set('FITTING', Configure.help[key])
             config.set('FITTING', key, val)
+
+        config.add_section('EXCITED')
+
+        for key, val in excited.items():
+            config.set('EXCITED', Configure.help[key])
+            config.set('EXCITED', key, val)
 
         config.add_section('DESCRIPTIONS')
 
@@ -356,11 +384,13 @@ def pretty_progress():
     Uses the log files to automatically generate a matrix which is then printed to screen in full colour 4k.
     """
 
+    printf = partial(print, flush=True)
+
     # Find the path of all files starting with QUBEKit_log and add their full path to log_files list
     log_files = []
     for root, dirs, files in os.walk('.', topdown=True):
         for file in files:
-            if 'QUBEKit_log.txt' in file:
+            if 'QUBEKit_log.txt' in file and 'backups' not in root:
                 log_files.append(os.path.abspath(f'{root}/{file}'))
 
     if not log_files:
@@ -399,15 +429,15 @@ def pretty_progress():
         'purple': '\033[1;35m'
     }
 
-    print('Displaying progress of all analyses in current directory.')
-    print(f'Progress key: {colours["green"]}\u2713{end} = Done;', end=' ')
-    print(f'{colours["blue"]}S{end} = Skipped;', end=' ')
-    print(f'{colours["red"]}E{end} = Error;', end=' ')
-    print(f'{colours["orange"]}R{end} = Running;', end=' ')
-    print(f'{colours["purple"]}~{end} = Queued')
+    printf('Displaying progress of all analyses in current directory.')
+    printf(f'Progress key: {colours["green"]}\u2713{end} = Done;', end=' ')
+    printf(f'{colours["blue"]}S{end} = Skipped;', end=' ')
+    printf(f'{colours["red"]}E{end} = Error;', end=' ')
+    printf(f'{colours["orange"]}R{end} = Running;', end=' ')
+    printf(f'{colours["purple"]}~{end} = Queued')
 
     header_string = '{:15}' + '{:>10}' * 10
-    print(header_string.format(
+    printf(header_string.format(
         'Name', 'Param', 'MM Opt', 'QM Opt', 'Hessian', 'Mod-Sem', 'Density', 'Charges', 'L-J', 'Tor Scan', 'Tor Opt'))
 
     # Sort the info alphabetically
@@ -415,27 +445,27 @@ def pretty_progress():
 
     # Outer dict contains the names of the molecules.
     for key_out, var_out in info.items():
-        print(f'{key_out[:13]:15}', end=' ')
+        printf(f'{key_out[:13]:15}', end=' ')
 
         # Inner dict contains the individual molecules' data.
         for var_in in var_out.values():
 
             if var_in == u'\u2713':
-                print(f'{colours["green"]}{var_in:>9}{end}', end=' ')
+                printf(f'{colours["green"]}{var_in:>9}{end}', end=' ')
 
             elif var_in == 'S':
-                print(f'{colours["blue"]}{var_in:>9}{end}', end=' ')
+                printf(f'{colours["blue"]}{var_in:>9}{end}', end=' ')
 
             elif var_in == 'E':
-                print(f'{colours["red"]}{var_in:>9}{end}', end=' ')
+                printf(f'{colours["red"]}{var_in:>9}{end}', end=' ')
 
             elif var_in == 'R':
-                print(f'{colours["orange"]}{var_in:>9}{end}', end=' ')
+                printf(f'{colours["orange"]}{var_in:>9}{end}', end=' ')
 
             elif var_in == '~':
-                print(f'{colours["purple"]}{var_in:>9}{end}', end=' ')
+                printf(f'{colours["purple"]}{var_in:>9}{end}', end=' ')
 
-        print('')
+        printf('')
 
 
 def populate_progress_dict(file_name):
@@ -452,7 +482,7 @@ def populate_progress_dict(file_name):
     search_terms = ['PARAMETRISATION', 'MM_OPT', 'QM_OPT', 'HESSIAN', 'MOD_SEM', 'DENSITY', 'CHARGE', 'LENNARD',
                     'TORSION_S', 'TORSION_O']
 
-    progress = OrderedDict((k, '~') for k in search_terms)
+    progress = OrderedDict((term, '~') for term in search_terms)
 
     restart_log = False
 
@@ -475,7 +505,7 @@ def populate_progress_dict(file_name):
                     # If its finishing tag is present it is done (tick)
                     elif 'FINISHING' in line:
                         progress[term] = u'\u2713'
-                    last_success = term
+                        last_success = term
 
             # If an error is found, then the stage after the last successful stage has errored (E)
             if 'Exception Logger - ERROR' in line:
@@ -490,13 +520,23 @@ def populate_progress_dict(file_name):
                     term = 'PARAMETRISATION'
                 progress[term] = 'E'
 
-    # Now we need to check if there was a restart and clear the progress of everything after the running step
     if restart_log:
         for term, stage in progress.items():
+            # Find where the program was restarted from
             if stage == 'R':
                 restart_term = search_terms.index(term)
                 break
+        else:
+            # If no stage is running, find the first stage that hasn't started; the first `~`
+            for term, stage in progress.items():
+                if stage == '~':
+                    restart_term = search_terms.index(term)
+                    break
+            else:
+                raise UnboundLocalError(
+                    'Cannot find where QUBEKit was restarted from. Please check the log file for progress.')
 
+        # Reset anything after the restart term to be `~` even if it was previously completed.
         for term in search_terms[restart_term + 1:]:
             progress[term] = '~'
 
@@ -595,3 +635,13 @@ def check_net_charge(charges, ideal_net=0, error=0.00001):
 
     print(f'Charge check successful. Net charge is within {error} of the desired net charge of {ideal_net}.')
     return True
+
+
+class OptimisationFailed(Exception):
+    """
+    Raise for seg faults from PSI4 - geomeTRIC/Torsiondrive/QCEngine interactions.
+    This should mean it's more obvious to users when there's a segfault.
+    """
+
+    # If we ever create a QUBEKit exceptions.py, this class will be moved there.
+    __module__ = Exception.__module__
