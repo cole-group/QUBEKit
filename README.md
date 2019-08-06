@@ -103,54 +103,27 @@ You should chose which version of Psi4 you require at the following link
 
 `https://admiring-tesla-08529a.netlify.com/installs/v132/`
 
-* [GeomeTRIC](https://github.com/leeping/geomeTRIC)
+Both QUBEkit and the following dependencies can be installed by typing the following command:
 
-`conda install -c conda-forge geometric` 
+`conda env create -f environment.yml`
+
+* [GeomeTRIC](https://github.com/leeping/geomeTRIC)
 
 * [OpenMM](http://openmm.org/)
 
-`conda install -c omnia openmm`
-
 * [RDKit](http://rdkit.org/)
-
-`conda install -c rdkit rdkit`
 
 * [OpenForceField](https://openforcefield.org/)
 
-`conda install -c omnia openforcefield`
-
 * [QCEngine](https://pypi.org/project/qcengine/)
-
-`pip install qcengine`
 
 * [TorsionDrive](https://github.com/lpwgroup/torsiondrive)
 
-
-`conda install -c conda-forge torsiondrive`
-
-
-**GUI Requirements**
-
 * [PyQt5](https://pypi.org/project/PyQt5/)
-
-`pip install PyQt5`
 
 * [PyQtWebEngine 5.12.1](https://pypi.org/project/PyQtWebEngine/)
 
-`pip install PyQtWebEngine`
-
 ---
-
-Adding lots of packages can be a headache. If possible, install using Anaconda through the terminal.
-This is generally safest, as Anaconda should deal with versions and conflicts in your environment.
-Generally, conda packages will have the conda install command on their website or github.
-For the software not available through Anaconda, or if Anaconda is having trouble resolving conflicts, either git clone them and install:
-
-    git clone http://<git_address_here>
-    cd <location of cloned package>
-    python setup.py install
-
-or follow the described steps in the respective documentation.
 
 You should now be able to use QUBEKit straight away from the command line or as an imported Python module.
 
