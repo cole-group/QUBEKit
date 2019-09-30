@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
-from collections import OrderedDict
+from QUBEKit.utils import constants
+from QUBEKit.utils.exceptions import PickleFileNotFound, QUBEKitLogFileNotFound
+
+from collections import OrderedDict, namedtuple
 from configparser import ConfigParser
 from contextlib import contextmanager
 import csv
-from functools import partial
+import decimal
+from importlib import import_module
 import math
+import operator
 import os
-from pathlib import Path
 import pickle
 
 import numpy as np
@@ -19,23 +23,21 @@ class Configure:
     settings as strings, all numbers must then be cast before use.
     """
 
-    # TODO Remove / merge the separate sections qm, fitting, descriptions?
-
-    home = Path.home()
-    config_folder = f'{home}/QUBEKit_configs/'
+    home = os.path.expanduser('~')
+    config_folder = os.path.join(home, 'QUBEKit_configs')
     master_file = 'master_config.ini'
 
     qm = {
         'theory': 'B3LYP',              # Theory to use in freq and dihedral scans recommended e.g. wB97XD or B3LYP
         'basis': '6-311++G(d,p)',       # Basis set
-        'vib_scaling': '0.967',         # Associated scaling to the theory
+        'vib_scaling': '1',         # Associated scaling to the theory
         'threads': '2',                 # Number of processors used in Gaussian09; affects the bonds and dihedral scans
         'memory': '2',                  # Amount of memory (in GB); specified in the Gaussian09 scripts
         'convergence': 'GAU_TIGHT',     # Criterion used during optimisations; works using PSI4, GeomeTRIC and G09
         'iterations': '350',            # Max number of optimisation iterations
         'bonds_engine': 'psi4',         # Engine used for bonds calculations
-        'density_engine': 'onetep',     # Engine used to calculate the electron density
-        'charges_engine': 'onetep',  # Engine used for charge partitioning
+        'density_engine': 'g09',        # Engine used to calculate the electron density
+        'charges_engine': 'chargemol',  # Engine used for charge partitioning
         'ddec_version': '6',            # DDEC version used by Chargemol, 6 recommended but 3 is also available
         'geometric': 'True',            # Use GeomeTRIC for optimised structure (if False, will just use PSI4)
         'solvent': 'True',              # Use a solvent in the PSI4/Gaussian09 input
@@ -50,12 +52,14 @@ class Configure:
         'refinement_method': 'SP',      # The type of QUBE refinement that should be done SP: single point energies
         'tor_limit': '20',              # Torsion Vn limit to speed up fitting
         'div_index': '0',               # Fitting starting index in the division array
-        'parameter_engine': 'xml',   # Method used for initial parametrisation
+        'parameter_engine': 'xml',      # Method used for initial parametrisation
         'l_pen': '0.0',                 # The regularisation penalty
+        'relative_to_global': 'False'   # If we should compute our relative energy surface
+                                        # compared to the global minimum
     }
 
     excited = {
-        'excited_state': 'False',      # Is this an excited state calculation
+        'excited_state': 'False',       # Is this an excited state calculation
         'excited_theory': 'TDA',
         'nstates': '3',
         'excited_root': '1',
@@ -87,6 +91,7 @@ class Configure:
         'dih_end': ';The last dihedral angle in the scan',
         't_weight': ';Weighting temperature that can be changed to better fit complicated surfaces',
         'l_pen': ';The regularisation penalty',
+        'relative_to_global': ';If we should compute our relative energy surface compared to the global minimum',
         'opt_method': ';The type of SciPy optimiser to use',
         'refinement_method': ';The type of QUBE refinement that should be done SP: single point energies',
         'tor_limit': ';Torsion Vn limit to speed up fitting',
@@ -102,30 +107,26 @@ class Configure:
         'pseudo_potential_block': ';Enter the pseudo potential block here eg'
     }
 
-    # TODO Why is this static? Shouldn't we just use self.qm, self.fitting etc
-    #  instead of Configure.qm, Configure.fitting?
-
-    @staticmethod
-    def load_config(config_file='default_config'):
+    def load_config(self, config_file='default_config'):
         """This method loads and returns the selected config file."""
 
         if config_file == 'default_config':
 
             # Check if the user has made a new master file to use
-            if Configure.check_master():
-                qm, fitting, excited, descriptions = Configure.ini_parser(f'{Configure.config_folder + Configure.master_file}')
+            if self.check_master():
+                qm, fitting, excited, descriptions = self.ini_parser(os.path.join(self.config_folder, self.master_file))
 
             else:
                 # If there is no master then assign the default config
-                qm, fitting, excited, descriptions = Configure.qm, Configure.fitting, Configure.excited, Configure.descriptions
+                qm, fitting, excited, descriptions = self.qm, self.fitting, self.excited, self.descriptions
 
         else:
             # Load in the ini file given
             if os.path.exists(config_file):
-                qm, fitting, excited, descriptions = Configure.ini_parser(config_file)
+                qm, fitting, excited, descriptions = self.ini_parser(config_file)
 
             else:
-                qm, fitting, excited, descriptions = Configure.ini_parser(Configure.config_folder + config_file)
+                qm, fitting, excited, descriptions = self.ini_parser(os.path.join(self.config_folder, config_file))
 
         # Now cast the numbers
         clean_ints = ['threads', 'memory', 'iterations', 'ddec_version', 'dih_start',
@@ -145,15 +146,12 @@ class Configure:
         # Now cast the one float the scaling
         qm['vib_scaling'] = float(qm['vib_scaling'])
 
-        # TODO Properly handle all command line / config arguments (not just geometric)
-
         # Now cast the bools
-        # TODO Storing this boolean might be a bit risky; may be better to just store a string until
-        #  config parsing begins in run.py
         qm['geometric'] = True if qm['geometric'].lower() == 'true' else False
         qm['solvent'] = True if qm['solvent'].lower() == 'true' else False
         excited['excited_state'] = True if excited['excited_state'].lower() == 'true' else False
         excited['use_pseudo'] = True if excited['use_pseudo'].lower() == 'true' else False
+        fitting['relative_to_global'] = True if fitting['relative_to_global'].lower() == 'true' else False
 
         # Now handle the weight temp
         if fitting['t_weight'] != 'infinity':
@@ -163,8 +161,7 @@ class Configure:
         fitting['l_pen'] = float(fitting['l_pen'])
 
         # return qm, fitting, descriptions
-        # TODO Fix this monstrosity; shouldn't need to cast to dict() but something must be broken
-        return {**dict(qm), **dict(fitting), **dict(excited), **dict(descriptions)}
+        return {**qm, **fitting, **excited, **descriptions}
 
     @staticmethod
     def ini_parser(ini):
@@ -179,75 +176,67 @@ class Configure:
 
         return qm, fitting, excited, descriptions
 
-    @staticmethod
-    def show_ini():
+    def show_ini(self):
         """Show all of the ini file options in the config folder."""
 
-        inis = [ini for ini in os.listdir(Configure.config_folder) if not ini.endswith('~')]  # Hide the emacs backups
+        # Hide the emacs backups
+        return [ini for ini in os.listdir(self.config_folder) if not ini.endswith('~')]
 
-        return inis
-
-    @staticmethod
-    def check_master():
+    def check_master(self):
         """Check if there is a new master ini file in the configs folder."""
 
-        return True if os.path.exists(Configure.config_folder + Configure.master_file) else False
+        return os.path.exists(os.path.join(self.config_folder, self.master_file))
 
-    @staticmethod
-    def ini_writer(ini):
+    def ini_writer(self, ini):
         """Make a new configuration file in the config folder using the current master as a template."""
 
         # make sure the ini file has an ini ending
         if not ini.endswith('.ini'):
             ini += '.ini'
 
-        # Check the current master template
-        if Configure.check_master():
-            # If master then load
-            qm, fitting, excited, descriptions = Configure.ini_parser(Configure.config_folder + Configure.master_file)
-
-        else:
-            # If default is the config file then assign the defaults
-            qm, fitting, excited, descriptions = Configure.qm, Configure.fitting, Configure.excited, Configure.descriptions
-
         # Set config parser to allow for comments
         config = ConfigParser(allow_no_value=True)
-        config.add_section('QM')
 
-        for key, val in qm.items():
-            config.set('QM', Configure.help[key])
-            config.set('QM', key, val)
+        categories = {
+            'QM': self.qm,
+            'FITTING': self.fitting,
+            'EXCITED': self.excited,
+            'DESCRIPTIONS': self.descriptions
+        }
 
-        config.add_section('FITTING')
+        for name, data in categories.items():
+            config.add_section(name)
+            for key, val in data.items():
+                config.set(name, self.help[key])
+                config.set(name, key, val)
 
-        for key, val in fitting.items():
-            config.set('FITTING', Configure.help[key])
-            config.set('FITTING', key, val)
-
-        config.add_section('EXCITED')
-
-        for key, val in excited.items():
-            config.set('EXCITED', Configure.help[key])
-            config.set('EXCITED', key, val)
-
-        config.add_section('DESCRIPTIONS')
-
-        for key, val in descriptions.items():
-            config.set('DESCRIPTIONS', Configure.help[key])
-            config.set('DESCRIPTIONS', key, val)
-
-        with open(f'{Configure.config_folder + ini}', 'w+') as out:
+        with open(os.path.join(self.config_folder, ini), 'w+') as out:
             config.write(out)
 
-    @staticmethod
-    def ini_edit(ini_file):
+    def ini_edit(self, ini_file):
         """Open the ini file for editing in the command line using whatever program the user wants."""
 
         # Make sure the ini file has an ini ending
         if not ini_file.endswith('.ini'):
             ini_file += '.ini'
 
-        os.system(f'emacs -nw {Configure.config_folder + ini_file}')
+        ini_path = os.path.join(self.config_folder, ini_file)
+        os.system(f'emacs -nw {ini_path}')
+
+
+Colours = namedtuple('colours', 'red green orange blue purple end')
+
+# Uses exit codes to set terminal font colours.
+# \033[ is the exit code. 1;32m are the style (bold); colour (green) m reenters the code block.
+# The second exit code resets the style back to default.
+COLOURS = Colours(
+    red='\033[1;31m',
+    green='\033[1;32m',
+    orange='\033[1;33m',
+    blue='\033[1;34m',
+    purple='\033[1;35m',
+    end='\033[0m'
+)
 
 
 def mol_data_from_csv(csv_name):
@@ -345,16 +334,13 @@ def append_to_log(message, msg_type='major'):
     """
 
     # Starting in the current directory walk back looking for the log file
-    # Stop at the first file found this should be our file
     search_dir = os.getcwd()
-    while True:
-        if 'QUBEKit_log.txt' in os.listdir(search_dir):
-            log_file = os.path.abspath(os.path.join(search_dir, 'QUBEKit_log.txt'))
-            break
+    while 'QUBEKit_log.txt' not in os.listdir(search_dir):
+        search_dir = os.path.split(search_dir)[0]
+        if not search_dir:
+            raise QUBEKitLogFileNotFound('Cannot locate QUBEKit log file.')
 
-        # Else we have to split the search path
-        else:
-            search_dir = os.path.split(search_dir)[0]
+    log_file = os.path.abspath(os.path.join(search_dir, 'QUBEKit_log.txt'))
 
     # Check if the message is a blank string to avoid adding blank lines and unnecessary separators
     if message:
@@ -371,20 +357,11 @@ def append_to_log(message, msg_type='major'):
             file.write(f'\n\n{"-" * 50}\n\n')
 
 
-def get_overage(molecule):
-    """Bodge."""
-
-    overage_dict = {'methane': 12.0, 'ethane': 16.0, 'acetone': 20.0, 'benzene': 24.0, 'methanol': 17.0}
-    return overage_dict[molecule]
-
-
 def pretty_progress():
     """
     Neatly displays the state of all QUBEKit running directories in the terminal.
     Uses the log files to automatically generate a matrix which is then printed to screen in full colour 4k.
     """
-
-    printf = partial(print, flush=True)
 
     # Find the path of all files starting with QUBEKit_log and add their full path to log_files list
     log_files = []
@@ -413,31 +390,15 @@ def pretty_progress():
         # Create ordered dictionary based on the log file info
         info[name] = populate_progress_dict(file)
 
-    # Uses exit codes to set terminal font colours.
-    # \033[ is the exit code. 1;32m are the style (bold); colour (green) m reenters the code block.
-    # The second exit code resets the style back to default.
-
-    # Need to add an end tag or terminal colours will persist
-    end = '\033[0m'
-
-    # Bold colours
-    colours = {
-        'red': '\033[1;31m',
-        'green': '\033[1;32m',
-        'orange': '\033[1;33m',
-        'blue': '\033[1;34m',
-        'purple': '\033[1;35m'
-    }
-
-    printf('Displaying progress of all analyses in current directory.')
-    printf(f'Progress key: {colours["green"]}\u2713{end} = Done;', end=' ')
-    printf(f'{colours["blue"]}S{end} = Skipped;', end=' ')
-    printf(f'{colours["red"]}E{end} = Error;', end=' ')
-    printf(f'{colours["orange"]}R{end} = Running;', end=' ')
-    printf(f'{colours["purple"]}~{end} = Queued')
+    print('Displaying progress of all analyses in current directory.')
+    print(f'Progress key: {COLOURS.green}\u2713{COLOURS.end} = Done;', end=' ')
+    print(f'{COLOURS.blue}S{COLOURS.end} = Skipped;', end=' ')
+    print(f'{COLOURS.red}E{COLOURS.end} = Error;', end=' ')
+    print(f'{COLOURS.orange}R{COLOURS.end} = Running;', end=' ')
+    print(f'{COLOURS.purple}~{COLOURS.end} = Queued')
 
     header_string = '{:15}' + '{:>10}' * 10
-    printf(header_string.format(
+    print(header_string.format(
         'Name', 'Param', 'MM Opt', 'QM Opt', 'Hessian', 'Mod-Sem', 'Density', 'Charges', 'L-J', 'Tor Scan', 'Tor Opt'))
 
     # Sort the info alphabetically
@@ -445,27 +406,27 @@ def pretty_progress():
 
     # Outer dict contains the names of the molecules.
     for key_out, var_out in info.items():
-        printf(f'{key_out[:13]:15}', end=' ')
+        print(f'{key_out[:13]:15}', end=' ')
 
         # Inner dict contains the individual molecules' data.
         for var_in in var_out.values():
 
             if var_in == u'\u2713':
-                printf(f'{colours["green"]}{var_in:>9}{end}', end=' ')
+                print(f'{COLOURS.green}{var_in:>9}{COLOURS.end}', end=' ')
 
             elif var_in == 'S':
-                printf(f'{colours["blue"]}{var_in:>9}{end}', end=' ')
+                print(f'{COLOURS.blue}{var_in:>9}{COLOURS.end}', end=' ')
 
             elif var_in == 'E':
-                printf(f'{colours["red"]}{var_in:>9}{end}', end=' ')
+                print(f'{COLOURS.red}{var_in:>9}{COLOURS.end}', end=' ')
 
             elif var_in == 'R':
-                printf(f'{colours["orange"]}{var_in:>9}{end}', end=' ')
+                print(f'{COLOURS.orange}{var_in:>9}{COLOURS.end}', end=' ')
 
             elif var_in == '~':
-                printf(f'{colours["purple"]}{var_in:>9}{end}', end=' ')
+                print(f'{COLOURS.purple}{var_in:>9}{COLOURS.end}', end=' ')
 
-        printf('')
+        print('')
 
 
 def populate_progress_dict(file_name):
@@ -479,14 +440,14 @@ def populate_progress_dict(file_name):
     """
 
     # Indicators in the log file which show a stage has completed
-    search_terms = ['PARAMETRISATION', 'MM_OPT', 'QM_OPT', 'HESSIAN', 'MOD_SEM', 'DENSITY', 'CHARGE', 'LENNARD',
-                    'TORSION_S', 'TORSION_O']
+    search_terms = ('PARAMETRISATION', 'MM_OPT', 'QM_OPT', 'HESSIAN', 'MOD_SEM', 'DENSITY', 'CHARGE', 'LENNARD',
+                    'TORSION_S', 'TORSION_O')
 
     progress = OrderedDict((term, '~') for term in search_terms)
 
     restart_log = False
 
-    with open(file_name, 'r') as file:
+    with open(file_name) as file:
         for line in file:
 
             # Reset progress when restarting (set all progress to incomplete)
@@ -505,20 +466,16 @@ def populate_progress_dict(file_name):
                     # If its finishing tag is present it is done (tick)
                     elif 'FINISHING' in line:
                         progress[term] = u'\u2713'
-                        last_success = term
 
             # If an error is found, then the stage after the last successful stage has errored (E)
             if 'Exception Logger - ERROR' in line:
                 # On the rare occasion that the error occurs after torsion optimisation (the final stage),
                 # a try except is needed to catch the index error (because there's no stage after torsion_optimisation).
-                try:
-                    term = search_terms[search_terms.index(last_success) + 1]
-                except IndexError:
-                    term = search_terms[search_terms.index(last_success)]
-                # If errored immediately, then last_success won't have been defined yet
-                except UnboundLocalError:
-                    term = 'PARAMETRISATION'
-                progress[term] = 'E'
+                for key, value in progress.items():
+                    if value == 'R':
+                        restart_term = search_terms.index(key)
+                        progress[key] = 'E'
+                        break
 
     if restart_log:
         for term, stage in progress.items():
@@ -532,13 +489,13 @@ def populate_progress_dict(file_name):
                 if stage == '~':
                     restart_term = search_terms.index(term)
                     break
-            else:
-                raise UnboundLocalError(
-                    'Cannot find where QUBEKit was restarted from. Please check the log file for progress.')
 
         # Reset anything after the restart term to be `~` even if it was previously completed.
-        for term in search_terms[restart_term + 1:]:
-            progress[term] = '~'
+        try:
+            for term in search_terms[restart_term + 1:]:
+                progress[term] = '~'
+        except UnboundLocalError:
+            pass
 
     return progress
 
@@ -551,13 +508,17 @@ def pretty_print(molecule, to_file=False, finished=True):
                   * On completion
     Print to terminal: * On call
                        * On completion
+
+    Strictly speaking this should probably be a method of ligand class as it explicitly uses ligand's custom
+    __str__ method with an extra argument.
     """
 
     pre_string = f'\n\nOn {"completion" if finished else "exception"}, the ligand objects are:'
 
     # Print to log file rather than to terminal
     if to_file:
-        with open(f'../QUBEKit_log.txt', 'a+') as log_file:
+        log_location = os.path.join(getattr(molecule, 'home'), 'QUBEKit_log.txt')
+        with open(log_location, 'a+') as log_file:
             log_file.write(f'{pre_string.upper()}\n\n{molecule.__str__()}')
 
     # Print to terminal
@@ -568,7 +529,7 @@ def pretty_print(molecule, to_file=False, finished=True):
         print('')
 
 
-def unpickle():
+def unpickle(location=None):
     """
     Function to unpickle a set of ligand objects from the pickle file, and return a dictionary of ligands
     indexed by their progress.
@@ -578,8 +539,20 @@ def unpickle():
 
     # unpickle the pickle jar
     # try to load a pickle file make sure to get all objects
-    pickle_file = f'{"" if ".QUBEKit_states" in os.listdir(".") else "../"}.QUBEKit_states'
-    with open(pickle_file, 'rb') as jar:
+    pickle_file = '.QUBEKit_states'
+    if location is not None:
+        pickle_path = os.path.join(location, pickle_file)
+
+    else:
+        search_dir = os.getcwd()
+        while pickle_file not in os.listdir(search_dir):
+            search_dir = os.path.split(search_dir)[0]
+            if not search_dir:
+                raise PickleFileNotFound('Pickle file not found; have you deleted it?')
+
+        pickle_path = os.path.join(search_dir, pickle_file)
+
+    with open(pickle_path, 'rb') as jar:
         while True:
             try:
                 mol = pickle.load(jar)
@@ -588,6 +561,25 @@ def unpickle():
                 break
 
     return mol_states
+
+
+def display_molecule_objects(*names):
+    """
+    prints the requested molecule objects in a nicely formatted way, easy to copy elsewhere.
+    :param names: list of strings where each item is the name of a molecule object such as 'basis' or 'coords'
+    """
+    try:
+        molecule = unpickle()['finalise']
+    except KeyError:
+        print('QUBEKit encountered an error during execution; returning the initial molecule objects.')
+        molecule = unpickle()['parametrise']
+
+    for name in names:
+        result = getattr(molecule, name, None)
+        if result is not None:
+            print(f'{name}:  {repr(result)}')
+        else:
+            print(f'Invalid molecule object: {name}. Please check the log file for the data you require.')
 
 
 @contextmanager
@@ -608,22 +600,23 @@ def assert_wrapper(exception_type):
 
     try:
         yield
-    except AssertionError as excep:
-        raise exception_type(*excep.args)
+    except AssertionError as exc:
+        raise exception_type(*exc.args)
 
 
-def check_symmetry(matrix, error=0.00001):
+def check_symmetry(matrix, error=1e-5):
     """Check matrix is symmetric to within some error."""
 
     # Check the matrix transpose is equal to the matrix within error.
     with assert_wrapper(ValueError):
         assert (np.allclose(matrix, matrix.T, atol=error)), 'Matrix is not symmetric.'
 
-    print(f'Symmetry check successful. The matrix is symmetric within an error of {error}.')
+    print(f'{COLOURS.purple}Symmetry check successful. '
+          f'The matrix is symmetric within an error of {error}.{COLOURS.end}')
     return True
 
 
-def check_net_charge(charges, ideal_net=0, error=0.00001):
+def check_net_charge(charges, ideal_net=0, error=1e-5):
     """Given a list of charges, check if the calculated net charge is within error of the desired net charge."""
 
     # Ensure total charge is near to integer value:
@@ -633,15 +626,98 @@ def check_net_charge(charges, ideal_net=0, error=0.00001):
         assert (abs(total_charge - ideal_net) < error), ('Total charge is not close enough to desired '
                                                          'integer value in configs.')
 
-    print(f'Charge check successful. Net charge is within {error} of the desired net charge of {ideal_net}.')
+    print(f'{COLOURS.purple}Charge check successful. '
+          f'Net charge is within {error} of the desired net charge of {ideal_net}.{COLOURS.end}')
     return True
 
 
-class OptimisationFailed(Exception):
+def collect_archive_tdrive(tdrive_record, client):
     """
-    Raise for seg faults from PSI4 - geomeTRIC/Torsiondrive/QCEngine interactions.
-    This should mean it's more obvious to users when there's a segfault.
+    This function takes in a QCArchive tdrive record and collects all of the final geometries and energies to be used in
+    torsion fitting.
+    :param client:  A QCPortal client instance.
+    :param tdrive_record: A QCArchive data object containing an optimisation and energy dictionary
+    :return: QUBEKit qm_scans data: list of energies and geometries [np.array(energies), [np.array(geometry)]]
     """
 
-    # If we ever create a QUBEKit exceptions.py, this class will be moved there.
-    __module__ = Exception.__module__
+    # Sort the dictionary by ascending keys
+    energy_dict = {int(key.strip('][')): value for key, value in tdrive_record.final_energy_dict.items()}
+    sorted_energies = sorted(energy_dict.items(), key=operator.itemgetter(0))
+
+    energies = np.array([x[1] for x in sorted_energies])
+
+    geometry = []
+    # Now make the optimization dict and store an array of the final geometry
+    for pair in sorted_energies:
+        min_energy_id = tdrive_record.minimum_positions[f'[{pair[0]}]']
+        opt_history = int(tdrive_record.optimization_history[f'[{pair[0]}]'][min_energy_id])
+        opt_struct = client.query_procedures(id=opt_history)[0]
+        geometry.append(opt_struct.get_final_molecule().geometry * constants.BOHR_TO_ANGS)
+        assert opt_struct.get_final_energy() == pair[1], "The energies collected do not match the QCArchive minima."
+
+    return [energies, geometry]
+
+
+def set_net(values, net=0, dp=6):
+    """
+    Take a list of values and make sure the sum is equal to net to the required dp
+    If they are not, add the extra to the final value in the list.
+    :param values: list of values
+    :param net: the desired total of the list
+    :param dp: the number of decimal places required
+    :return: the list of updated values with the correct net value
+    """
+
+    decimal.getcontext().prec = dp
+    new_values = [decimal.Decimal(str(val)) for val in values]
+    extra = net - sum(new_values)
+    if extra:
+        new_values[-1] += extra
+
+    return new_values
+
+
+def make_and_change_into(name):
+    """
+    - Attempt to make a directory with name <name>, don't fail if it exists.
+    - Change into the directory.
+    """
+
+    try:
+        os.mkdir(name)
+    except FileExistsError:
+        pass
+    finally:
+        os.chdir(name)
+
+
+def missing_import(name, fail_msg=''):
+    """
+    Generates a class which raises an import error when initialised.
+    e.g. SomeClass = missing_import('SomeClass') will make SomeClass() raise ImportError
+    """
+    def init(self, *args, **kwargs):
+        raise ImportError(
+            f'The class {name} you tried to call is not importable; '
+            f'this is likely due to it not doing installed.\n\n'
+            f'{f"Fail Message: {fail_msg}" if fail_msg else ""}'
+        )
+    return type(name, (), {'__init__': init})
+
+
+def try_load(engine, module):
+    """
+    Try to load a particular engine from a module.
+    If this fails, a dummy class is imported in its place with an import error raised on initialisation.
+
+    :param engine: Name of the engine (PSI4, OpenFF, ONETEP, etc).
+    :param module: Name of the QUBEKit module (.psi4, .openff, .onetep, etc).
+    :return: Either the engine is imported as normal, or it is replaced with dummy class which
+    just raises an import error with a message.
+    """
+    try:
+        module = import_module(module, __name__)
+        return getattr(module, engine)
+    except (ModuleNotFoundError, AttributeError) as exc:
+        print(f'{COLOURS.orange}Warning, failed to load: {engine}; continuing for now.\nReason: {exc}{COLOURS.end}\n')
+        return missing_import(engine, fail_msg=str(exc))

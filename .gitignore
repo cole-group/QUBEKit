@@ -1,10 +1,13 @@
 dist
 build
 qubekit.egg-info
+VEHICLe
 .pytest_cache
 .idea
 *.pdb
 *.mol
+*.mol2
 *.z
 *.csv
 *.dat
+!QUBEKit/tests/files/*

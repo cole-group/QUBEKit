@@ -26,7 +26,7 @@ setup(
             'QUBEKit-gui = QUBEKit.GUI.gui:main'
         ]
     },
-    version='2.3.2',
+    version='2.6.3',
     license='MIT',
     classifiers=[
         'Intended Audience :: Science/Research',
@@ -34,6 +34,6 @@ setup(
         'Topic :: Scientific/Engineering :: Chemistry',
         'Programming Language :: Python :: 3.6',
     ],
-    python_requires='~=3.6'
+    python_requires='~=3.6',
 )
 

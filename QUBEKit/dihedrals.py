@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
-
-from QUBEKit.decorators import timer_logger, for_all_methods
-from QUBEKit.engines import PSI4, OpenMM, Gaussian
+from QUBEKit.engines import PSI4, OpenMM, Gaussian, RDKit
+from QUBEKit.utils import constants
+from QUBEKit.utils.decorators import timer_logger, for_all_methods
+from QUBEKit.utils.exceptions import TorsionDriveFailed
+from QUBEKit.utils.helpers import make_and_change_into
 
 from collections import OrderedDict
 from copy import deepcopy
@@ -12,57 +14,61 @@ import subprocess as sp
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import minimize
-
-from torsiondrive.dihedral_scanner import DihedralScanner
-from torsiondrive.extra_constraints import make_constraints_dict, check_conflict_constraints
-from torsiondrive.launch import create_engine, load_dihedralfile
+from scipy.optimize import minimize, differential_evolution
+from scipy.stats import linregress
+from datetime import datetime
 
 
 @for_all_methods(timer_logger)
 class TorsionScan:
     """
     This class will take a QUBEKit molecule object and perform a torsiondrive QM energy scan
-    for each selected dihedral.
+    for each selected rotatable dihedral.
 
     inputs
     ---------------
-    molecule                    A QUBEKit Ligand instance
-    configs                     A QUBEKit config dict that will be used to instance the PSI4 engine, only option
-    native_opt                  Should we use the QM engines internal optimizer or torsiondrive/geometric
+    molecule                A QUBEKit Ligand instance
+    constraints_made        The name of the constraints file that should be used during the torsiondrive (pis4 only)
 
     attributes
     ---------------
-    grid_space                  The distance between the scan points on the surface
+    qm_engine               An instance of the QM engine used for any calculations
+    native_opt              Chosen dynamically whether to use geometric or not (geometric is need to use constraints)
+    inputfile               The name of the template file for tdrive, name depends on the qm_engine used
+    grid_space              The distance between the scan points on the surface
+    scan_start              The starting angle of the dihedral during the scan
+    scan_end                The final angle of the dihedral
+    home                    The starting location of the job, helpful when scanning multiple angles.
     """
 
-    def __init__(self, molecule, verbose=False, constraints_made=None):
-        #TODO test with constraints
+    def __init__(self, molecule, constraints_made=None):
 
         # engine info
-        self.qm_engine = {'psi4': PSI4, 'g09': Gaussian}.get(molecule.bonds_engine)(molecule)
+        self.qm_engine = {'psi4': PSI4, 'g09': Gaussian, 'g16': Gaussian}.get(molecule.bonds_engine)(molecule)
         self.native_opt = True
-        if molecule.geometric:
+        # Ensure geometric can only be used with psi4  so far
+        if molecule.geometric and molecule.bonds_engine == 'psi4':
             self.native_opt = False
-        self.verbose = verbose
-        self.inputfile = None
+        self.input_file = None
 
         # molecule
         self.molecule = molecule
+        # We need just a regular convergence criteria at this point
+        self.molecule.convergence = 'GAU'
         self.constraints_made = constraints_made
-        self.grid_space = [molecule.increment]
+        self.grid_space = molecule.increment
         self.scan_start = molecule.dih_start
         self.scan_end = molecule.dih_end
 
         # working dir
         self.home = os.getcwd()
 
-    def find_scan_order(self, file=None):
+    def find_scan_order(self):
         """
         Function takes the molecule and displays the rotatable central bonds,
-        the user then enters the number of the torsions to be scanned in the order to be scanned.
+        the user then enters the numbers of the torsions to be scanned (in the order they'll be scanned in).
         The molecule can also be supplied with a scan order already, if coming from csv.
-        Else the user can supply a torsiondrive style QUBE_torsions.txt file that we can extract the parameters from.
+        Else the user can supply a torsiondrive style QUBE_torsions.txt file we can extract the parameters from.
         """
 
         if self.molecule.scan_order:
@@ -76,20 +82,6 @@ class TorsionScan:
             print('One rotatable torsion found')
             self.molecule.scan_order = self.molecule.rotatable
 
-        # If we have a QUBE_torsions.txt file get the scan order from there
-        elif file:
-            scan_order = []
-            torsions = open(file).readlines()
-            for line in torsions[2:]:
-                torsion = line.split()
-                core = (int(torsion[1]), int(torsion[2]))
-                if core in self.molecule.rotatable:
-                    scan_order.append(core)
-                elif reversed(tuple(core)) in self.molecule.rotatable:
-                    scan_order.append(reversed(tuple(core)))
-
-            self.molecule.scan_order = scan_order
-
         else:
             # Get the rotatable dihedrals from the molecule
             rotatable = list(self.molecule.rotatable)
@@ -97,13 +89,12 @@ class TorsionScan:
             print('Torsion number   Central-Bond   Representative Dihedral')
             for i, bond in enumerate(rotatable):
                 print(f'  {i + 1}                    {bond[0]}-{bond[1]}             '
-                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][0]].name}-'
-                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][1]].name}-'
-                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][2]].name}-'
-                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][3]].name}')
+                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][0]].atom_name}-'
+                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][1]].atom_name}-'
+                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][2]].atom_name}-'
+                      f'{self.molecule.atoms[self.molecule.dihedrals[bond][0][3]].atom_name}')
 
-            scans = list(input('>'))  # Enter as a space separated list
-            scans[:] = [scan for scan in scans if scan != ' ']  # remove all spaces from the scan list
+            scans = input('>').split()
 
             scan_order = []
             # Add the rotatable dihedral keys to an array
@@ -114,121 +105,92 @@ class TorsionScan:
     def tdrive_scan_input(self, scan):
         """Function takes the rotatable dihedrals requested and writes a scan input file for torsiondrive."""
 
+        # Write the dihedrals.txt file for tdrive
         with open('dihedrals.txt', 'w+') as out:
 
             out.write('# dihedral definition by atom indices starting from 0\n#zero_based_numbering\n'
-                      '# i     j     k     l\n')
+                      '# i     j     k     l     ')
+            # This adds suport for range limited runs but is only need if we move away from the default range
+            if self.molecule.dih_start != -165 or self.molecule.dih_end != 180:
+                out.write('(range_low)     (range_high)\n')
+            else:
+                out.write('\n')
             scan_di = self.molecule.dihedrals[scan][0]
-            out.write(f'  {scan_di[0]}     {scan_di[1]}     {scan_di[2]}     {scan_di[3]}\n')
+            out.write(f'  {scan_di[0]}     {scan_di[1]}     {scan_di[2]}     {scan_di[3]}     ')
+            if self.molecule.dih_start != -165 or self.molecule.dih_end != 180:
+                out.write(f'{self.molecule.dih_start}     {self.molecule.dih_end}\n')
+            else:
+                out.write('\n')
 
+        # Then write the template input file for tdrive in g09 or psi4 format
         if self.native_opt:
-            self.qm_engine.generate_input(optimise=True, execute=False)
-            self.inputfile = 'input.dat'
+            self.qm_engine.generate_input(optimise=True, execute=False, red_mode=True)
+            if self.qm_engine.__class__.__name__.lower() == 'psi4':
+                self.input_file = 'input.dat'
+            else:
+                self.input_file = f'gj_{self.molecule.name}.com'
 
         else:
             self.qm_engine.geo_gradient(execute=False, threads=True)
-            self.inputfile = f'{self.molecule.name}.psi4in'
+            self.input_file = f'{self.molecule.name}.{self.qm_engine.__class__.__name__.lower()}in'
 
     def start_torsiondrive(self, scan):
         """Start a torsiondrive either using psi4 or native gaussian09"""
 
-        if self.qm_engine.__class__.__name__ == 'PSI4':
-            # First set up the required files
-            self.tdrive_scan_input(scan)
-            # Read the dihedral file and set zero based numbering
-            dihedral_idxs, dihedral_ranges = load_dihedralfile('dihedrals.txt', True)
-            grid_dim = len(dihedral_idxs)
+        # TODO maybe we should be using the json api to have more control over the engine settings
+        #  we could also run multiple grid points at the same time, progress reporting would also be
+        #  better
 
-            # Parse additional constraints if present
-            constraints_dict = None
-            if self.constraints_made is not None:
-                with open(self.constraints_made) as fin:
-                    constraints_dict = make_constraints_dict(fin.read())
-                    # check if there are extra constraints conflict with the specified dihedral angles
-                    check_conflict_constraints(constraints_dict, dihedral_idxs)
+        # First set up the required files
+        self.tdrive_scan_input(scan)
 
-            # Format grid spacing
-            n_grid_spacing = len(self.grid_space)
-            if n_grid_spacing == grid_dim:
-                grid_spacing = self.grid_space
-            elif n_grid_spacing == 1:
-                grid_spacing = self.grid_space * grid_dim
-            else:
-                raise ValueError(f"Number of grid_spacing values {grid_dim} "
-                                 f"is not consistent with number of dihedral angles {n_grid_spacing}")
+        # Now we need to run torsiondrive through the CLI
+        with open('tdrive.log', 'w') as log:
+            # When we start the run write the options used here to be used during restarts
+            log.write(f'Theory used: {self.molecule.theory}   Basis used: {self.molecule.basis}\n')
+            log.flush()
+            tdrive_engine = self.qm_engine.__class__.__name__.lower()
 
-            # create QM Engine, and WorkQueue object if provided port
-            engine = create_engine('psi4', inputfile=self.inputfile, work_queue_port=None,
-                                   native_opt=self.native_opt)
+            cmd = (f'torsiondrive-launch -e {tdrive_engine} {self.input_file} dihedrals.txt -v '
+                   f'{"--native_opt" if self.native_opt else ""}')
 
-            # create DihedralScanner object
-            scanner = DihedralScanner(engine, dihedrals=dihedral_idxs, dihedral_ranges=dihedral_ranges,
-                                      grid_spacing=grid_spacing, init_coords_M=None,
-                                      energy_decrease_thresh=1e-5, energy_upper_limit=None,
-                                      extra_constraints=constraints_dict, verbose=self.verbose)
-            # Run the torsiondrive
-            scanner.master()
-            # Gather the results
+            sp.run(cmd, shell=True, stdout=log, check=True, stderr=log, bufsize=0)
+
+        # Gather the results
+        try:
             self.molecule.read_tdrive(scan)
-
-        elif self.qm_engine.__class__.__name__ == 'Gaussian':
-            # Make the individual run folders for gaussian
-            # Then run the native optimiser and collect the results
-            temp_home = os.getcwd()
-            scan_dihedral = list(x + 1 for x in self.molecule.dihedrals[scan][0])
-            energies = []
-            scan_coords = []
-            for run in range(self.scan_start, self.scan_end, self.grid_space[0]):
-                os.mkdir(f'run_{run}')
-                os.chdir(f'run_{run}')
-                # Make the job file
-                red_mode = [scan_dihedral, run]
-                result = self.qm_engine.generate_input(input_type='input', optimise=True, red_mode=red_mode)
-                if result['success']:
-                    coords, e = self.qm_engine.optimised_structure()
-                    energies.append(e)
-                    scan_coords.append(coords)
-                os.chdir(temp_home)
-
-            # Store the scan info back into the molecule
-            self.molecule.qm_scans[scan] = [np.array(energies), scan_coords]
-
-            # We should also write out a scan file with the full traj in it
-            self.molecule.coords['traj'] = scan_coords
-            self.molecule.write_xyz('traj')
+        except FileNotFoundError:
+            raise TorsionDriveFailed('Torsiondrive output qdata.txt missing; job did not execute or finish properly')
 
     def collect_scan(self):
         """
-        Collect the results of a gaussian scan and put them in the molecule, add QUBEKit-v1 compatibility
+        Collect the results of a torsiondrive scan that has not been done using QUBEKit.
         :return: The energies and coordinates into the molecule
         """
-
-        energies = []
-        scan_coords = []
         for scan in self.molecule.scan_order:
-            try:
-                os.chdir(os.path.join(self.home, os.path.join(f'SCAN_{scan[0]}_{scan[1]}', 'QM_torsiondrive')))
-                temp_home = os.getcwd()
+            os.chdir(os.path.join(self.home, os.path.join(f'SCAN_{scan[0]}_{scan[1]}', 'QM_torsiondrive')))
+            self.molecule.read_tdrive(scan)
 
-                if self.molecule.bonds_engine == 'psi4':
-                    self.molecule.read_tdrive(scan)
+    def check_run_history(self, scan):
+        """
+        Check the contents of a scan folder to see if we should continue the run;
+        if the settings (theory and basis) are the same then continue
+        :return: If we should continue the run
+        """
 
-                elif self.molecule.bonds_engine == 'g09':
-                    for run in range(self.scan_start, self.scan_end, self.grid_space[0]):
-                        os.chdir(f'run_{run}')
-                        # Make the job file
-                        coords, e = self.qm_engine.optimised_structure()
-                        energies.append(e)
-                        scan_coords.append(coords)
-                        os.chdir(temp_home)
+        # Try and open the tdrive.log file to check the old running options
+        try:
+            file_path = os.path.join(os.getcwd(), os.path.join(f'SCAN_{scan[0]}_{scan[1]}', os.path.join('QM_torsiondrive', 'tdrive.log')))
+            with open(file_path) as t_log:
+                header = t_log.readline().split('Basis used:')
 
-                    # Store the scan in the molecule and make a traj file
-                    self.molecule.qm_scans[scan] = [np.array(energies), scan_coords]
-                    self.molecule.coords['traj'] = scan_coords
-                    self.molecule.write_xyz('traj')
+            # This is needed for the case of a split theory e.g. EmpiricalDispersion=GD3BJ B3LYP
+            basis = header[1].strip()
+            theory = header[0].split('Theory used:')[1].strip()
+            return self.molecule.theory == theory and self.molecule.basis == basis
 
-            except FileNotFoundError:
-                raise FileNotFoundError(f'SCAN_{scan[0]}_{scan[1]} missing')
+        except FileNotFoundError:
+            return False
 
     def scan(self):
         """Makes a folder and writes a new a dihedral input file for each scan and runs the scan."""
@@ -244,11 +206,10 @@ class TorsionScan:
             try:
                 os.mkdir(f'SCAN_{scan[0]}_{scan[1]}')
             except FileExistsError:
-                # If the folder has only been used to test the torsions then use that folder
-                if os.listdir(f'SCAN_{scan[0]}_{scan[1]}') == ['testing_torsion']:
-                    pass
-                # However, if there is a full run in the folder, back the folder up and start again
-                else:
+                # If there is a run in the folder, check if we are continuing an old run by matching the settings
+                con_scan = self.check_run_history(scan)
+                if not con_scan:
+
                     print(f'SCAN_{scan[0]}_{scan[1]} folder present backing up folder to SCAN_{scan[0]}_{scan[1]}_tmp')
                     # Remove old backups
                     try:
@@ -257,10 +218,10 @@ class TorsionScan:
                         pass
                     os.system(f'mv SCAN_{scan[0]}_{scan[1]} SCAN_{scan[0]}_{scan[1]}_tmp')
                     os.mkdir(f'SCAN_{scan[0]}_{scan[1]}')
-                    pass
+
             os.chdir(f'SCAN_{scan[0]}_{scan[1]}')
-            os.mkdir('QM_torsiondrive')
-            os.chdir('QM_torsiondrive')
+
+            make_and_change_into('QM_torsiondrive')
 
             # Start the torsion drive if psi4 else run native separate optimisations using g09
             self.start_torsiondrive(scan)
@@ -313,25 +274,25 @@ class TorsionOptimiser:
     qm_local                the location of the QM torsiondrive
     """
 
-    def __init__(self, molecule, weight_mm=True, use_force=False, step_size=0.02, error_tol=1e-5,
-                 x_tol=1e-5, refinement='Steep', vn_bounds=20):
+    def __init__(self, molecule, weight_mm=True, step_size=0.02, error_tol=1e-5, x_tol=1e-5):
 
-        # QUBEKit objects
         self.molecule = molecule
-        self.qm_engine = {'psi4': PSI4, 'g09': Gaussian}.get(self.molecule.bonds_engine)(molecule)
+        self.qm_engine = {'psi4': PSI4, 'g09': Gaussian, 'g16': Gaussian}.get(self.molecule.bonds_engine)(molecule)
 
-        # configurations
-        self.l_pen = self.molecule.l_pen
-        self.t_weight = self.molecule.t_weight
+        # Configurations
         self.weight_mm = weight_mm
         self.step_size = step_size
-        self.methods = {'NM': 'Nelder-Mead', 'BFGS': 'BFGS', None: None}
-        self.method = self.methods[self.molecule.opt_method]
         self.error_tol = error_tol
         self.x_tol = x_tol
-        self.use_Force = use_force
-        self.abs_bounds = vn_bounds
-        self.refinement = refinement
+
+        self.l_pen = self.molecule.l_pen
+        self.t_weight = self.molecule.t_weight
+        self.abs_bounds = molecule.tor_limit
+        self.refinement = molecule.refinement_method
+        # Scipy optimisation methods also hybryd methods that use one method for the first fit then switch
+        # eg (GA_BFGS, GA_NM, NM_GA, BFGS_GA)
+        self.methods = {'NM': 'Nelder-Mead', 'BFGS': 'BFGS', 'GA': 'Genetic'}
+        self.method = self.methods.get(self.molecule.opt_method, None)
 
         # TorsionOptimiser starting parameters
         self.scans_dict = deepcopy(molecule.qm_scans)
@@ -352,85 +313,48 @@ class TorsionOptimiser:
         self.torsion_store = None
         self.index_dict = {}
         self.qm_local = None
+        self.rmsd_atoms = []
+        self.optimiser_log = None
+
         # Convert the optimised qm coords to OpenMM format
         self.opt_coords = self.molecule.openmm_coordinates(input_type='qm')
-        self.optimiser_log = open('Optimiser_log.txt', 'w')
-        self.optimiser_log.write('Starting dihedral optimisation.\n')
 
         # constants
-        self.k_b = 0.001987
-        self.phases = [0, 3.141592653589793, 0, 3.141592653589793]
+        self.k_b = constants.KB_KCAL_P_MOL_K
+        self.phases = [0, constants.PI, 0, constants.PI]
         self.home = os.getcwd()
 
         # start the OpenMM system
         self.molecule.write_pdb()
-        self.rest_torsions()
+        self.load_torsions()
         # Now start the OpenMM engine
-        self.openMM = OpenMM(self.molecule)
+        self.open_mm = OpenMM(self.molecule)
 
     def mm_energies(self):
-        """Evaluate the MM energies of the QM structures."""
+        """
+        Evaluate the MM energies of the geometries stored in scan_coords.
+        :return: A numpy array of the energies for easy normalisation.
+        """
 
-        mm_energy = []
-        for position in self.scan_coords:
-            mm_energy.append(self.openMM.get_energy(position))
+        return np.array([self.open_mm.get_energy(position) for position in self.scan_coords])
 
-        return np.array(mm_energy)
-
-    # @staticmethod
-    # def get_coords(engine):
-    #     """
-    #     Read the torsion drive output file to get all of the coords in a format that can be passed to openmm
-    #     so we can update positions in context without reloading the molecule.
-    #     """
-    #
-    #     scan_coords = []
-    #     if engine == 'torsiondrive':
-    #         # open the torsion drive data file read all the scan coordinates
-    #         with open('qdata.txt', 'r') as data:
-    #             for line in data.readlines():
-    #                 if 'COORDS' in line:
-    #                     # get the coords into a single array
-    #                     coords = [float(x) / 10 for x in line.split()[1:]]
-    #                     # convert to a list of tuples for OpenMM format
-    #                     tups = []
-    #                     for i in range(0, len(coords), 3):
-    #                         tups.append((coords[i], coords[i + 1], coords[i + 2]))
-    #                     scan_coords.append(tups)
-    #
-    #     # get the coords from a geometric output
-    #     elif engine == 'geometric':
-    #         with open('scan-final.xyz', 'r') as data:
-    #             lines = data.readlines()
-    #             # get the amount of atoms
-    #             atoms = int(lines[0])
-    #             for i, line in enumerate(lines):
-    #                 if 'Iteration' in line:
-    #                     # this is the start of the coordinates
-    #                     tups = []
-    #                     for coords in lines[i + 1:i + atoms + 1]:
-    #                         coord = tuple(float(x) / 10 for x in coords.split()[1:])
-    #                         # convert to a list of tuples for OpenMM format
-    #                         # store tuples
-    #                         tups.append(coord)
-    #                     # now store that structure back to the coords list
-    #                     scan_coords.append(tups)
-    #     return scan_coords
-
-    def initial_energies(self):
-        """Calculate the initial energies using the input xml."""
+    def reset_torsions(self):
+        """Reset all torsion values to their initial and create the torsion index dictionary."""
 
         # first we need to work out the index order the torsions are in while inside the OpenMM system
         # this order is different from the xml order
-        forces = {self.openMM.simulation.system.getForce(index).__class__.__name__: self.openMM.simulation.system.getForce(index) for
-                  index in range(self.openMM.simulation.system.getNumForces())}
+        forces = {self.open_mm.simulation.system.getForce(index).__class__.__name__: self.open_mm.simulation.system.getForce(index) for
+                  index in range(self.open_mm.simulation.system.getNumForces())}
         torsion_force = forces['PeriodicTorsionForce']
+
         for i in range(torsion_force.getNumTorsions()):
-            p1, p2, p3, p4, periodicity, phase, k = torsion_force.getTorsionParameters(i)
-            torsion = (p1, p2, p3, p4)
+            # torsion, periodicity, phase, k
+            *torsion, _, _, _ = torsion_force.getTorsionParameters(i)
+            torsion = tuple(torsion)
             if torsion not in self.index_dict:
                 self.index_dict[torsion] = i
 
+        improper_index_keys = [tuple(sorted(key)) for key in self.index_dict.keys()]
         # Now, reset all periodic torsion terms back to their initial values
         for pos, key in enumerate(self.torsion_store):
             try:
@@ -442,22 +366,20 @@ class TorsionOptimiser:
                                            [self.index_dict[tuple(reversed(key))]]]
                 except KeyError:
                     # after trying to match the forward and backwards strings must be improper
-                    self.tor_types[pos] = [[(key[1], key[2], key[0], key[3])], [float(self.torsion_store[key][i][1]) for i in range(4)],
-                                           [self.index_dict[(key[1], key[2], key[0], key[3])]]]
+                    # now we have to work out the order it was stored in the system
+                    improper_key = list(self.index_dict.keys())[improper_index_keys.index(tuple(sorted(key)))]
+                    self.tor_types[pos] = [[improper_key], [float(self.torsion_store[key][i][1]) for i in range(4)],
+                                           [self.index_dict[improper_key]]]
 
         self.update_torsions()
-        # initial is a referenceto the energy surface at the start of the fit
-        self.initial_energy = deepcopy(self.mm_energies())
-        # starting energy is the surface made by the original unfit parameters
-        self.starting_energy = deepcopy(self.initial_energy)
 
         # Reset the dihedral values
         self.tor_types = OrderedDict()
 
     def update_tor_vec(self, x):
         """Update the tor_types dict with the parameter vector."""
-
-        x = np.round(x, decimals=4)
+        # Round to 6 dp as this is the precision that will be in the xml files.
+        x = np.round(x, decimals=6)
 
         # Update the param vector for the right torsions by slicing the vector every 4 places
         for key, val in self.tor_types.items():
@@ -469,7 +391,7 @@ class TorsionOptimiser:
         # Update the parameter vector into tor_types
         self.update_tor_vec(x)
 
-        # Update the torsions in the Openmm system
+        # Update the torsions in the OpenMM system
         self.update_torsions()
 
         # Get the mm corresponding energy
@@ -479,12 +401,13 @@ class TorsionOptimiser:
         assert len(self.qm_energy) == len(self.mm_energy)
 
         # Calculate the objective
-        # Get the energy of the qm structure with the new parameters
-        optimised_energy = self.openMM.get_energy(self.opt_coords)
+        # Make the mm energy relative to mm predicted energy of the qm optimised structure,
+        # or lowest energy structure of scan
+        if self.molecule.relative_to_global:
+            mm_energy = self.mm_energy - self.open_mm.get_energy(self.opt_coords)
+        else:
+            mm_energy = self.mm_energy - self.mm_energy.min()
 
-        # Make the mm energy relative to mm predicted energy of the qm structure
-        mm_energy = self.mm_energy - optimised_energy
-        # mm_energy = self.mm_energy - self.mm_energy.min()
         error = (mm_energy - self.qm_energy) ** 2
 
         # if using a weighting, add that here
@@ -505,7 +428,7 @@ class TorsionOptimiser:
         return total_error
 
     def steep_objective(self, x):
-        """Return the output of the objective function when using the steep refinment method."""
+        """Return the output of the objective function when using the steep refinement method."""
 
         # Update the parameter vector into tor_types
         self.update_tor_vec(x)
@@ -525,7 +448,7 @@ class TorsionOptimiser:
         # calculate the objective
 
         # Adjust the mm energy to make it relative to the lowest in the scan
-        self.mm_energy -= min(self.mm_energy)
+        self.mm_energy -= self.mm_energy.min()
         error = (self.mm_energy - self.qm_energy) ** 2
 
         # if using a weighting, add that here
@@ -547,16 +470,20 @@ class TorsionOptimiser:
         method (fit only new generation)
         -------------------
         1) take parameters from the initial scipy fitting.
-        2) Do a MM torsion scan with the parameters and get the rmsd error
-        3) Calculate the QM single point energies from the structures and get the energy error
-        4) Calculate the total error if not converged fit using scipy to all structures and move to step 2)
+        2) Do a MM torsion scan with the parameters and get the rmsd error and energy error between this new surface
+        and the qm optimised surface
+        3) Now fit to the qm surface again using a small restrain penalty
         """
 
         converged = False
 
+        # Set the optimisation method if we have a hybrd method we need to try and take the last option
+        self.method = self.methods.get(self.molecule.opt_method.split('_')[-1], None)
+        print(f'The optimisation method is {self.method}')
+
         # put in the objective dict
-        objective = {'fitting error': [],
-                     'energy error': [],
+        objective = {'fitting_error': [],
+                     'energy_error': [],
                      'rmsd': [],
                      'total': [],
                      'parameters': []}
@@ -565,11 +492,7 @@ class TorsionOptimiser:
         # start the main optimizer loop by calculating new single point energies
         while not converged:
             # move into the first iteration folder
-            try:
-                os.mkdir(f'Iteration_{iteration}')
-            except FileExistsError:
-                pass
-            os.chdir(f'Iteration_{iteration}')
+            make_and_change_into(f'Iteration_{iteration}')
 
             # step 2 MM torsion scan
             # with wavefront propagation, returns the new set of coords these become the new scan coords
@@ -578,44 +501,44 @@ class TorsionOptimiser:
             # also save these coords to the coords store
             self.coords_store = deepcopy(self.coords_store + self.scan_coords)
 
-            # # step 3 calculate the rmsd for these structures compared to QM
-            rmsd = self.rmsd(self.initial_coords, self.scan_coords)
+            # step 3 calculate the rmsd for these structures compared to QM ones
+            rmsd_vector = self.scan_rmsd(self.scan_coords)
 
-            # step 4 calculate the single point energies
-            self.qm_energy = self.single_point()
-
-            # Keep a copy of the energy before adjusting in case another loop is needed
-            self.energy_store_qm = deepcopy(np.append(self.energy_store_qm, self.qm_energy))
-
-            # Normalise the qm energy again using the qm reference energy
-            self.qm_normalise(rel_to_optimised=True)
-
-            # calculate the energy error in step 4 (just for this scan) and get a measure of the new reference energies
+            # Calculate how well the new relative surface represents the QM one
             energy_error = self.objective(opt_parameters)
+
             # this now acts as the intial energy for the next fit
             self.initial_energy = deepcopy(self.mm_energy)
 
             # add the results to the dictionary
-            objective['fitting error'].append(fitting_error)
-            objective['energy error'].append(energy_error)
-            objective['rmsd'].append(rmsd['total'])
-            objective['total'].append(energy_error + rmsd['total'])
+            objective['fitting_error'].append(fitting_error)
+            objective['energy_error'].append(energy_error)
+            objective['rmsd'].append(sum(rmsd_vector) / len(rmsd_vector))
+            objective['total'].append(energy_error + sum(rmsd_vector) / len(rmsd_vector))
             objective['parameters'].append(opt_parameters)
 
+            # Check convergence
+            if objective['total'][-1] <= 0.25:
+                converged = True
+                print(f'Fitting converged after {iteration} iterations exiting...')
+                # This takes us out of the refinement loop and stops any parameter changes
+                iteration = 5
+
             # Print the results of the iteration
-            self.optimiser_log.write('After the fist refinement round the errors are:\n')
+            self.optimiser_log.write('After refinement the errors are:\n')
             for error, value in objective.items():
                 self.optimiser_log.write(f'{error}: {value}\n')
+            self.optimiser_log.flush()
 
-            # now check to see if the error has converged?
-            if iteration < 3:
+            # Has the error converged?
+            if iteration < 5:
 
-                # now we don't want to move to far away from the last set of optimized parameters
+                # Don't move too far away from the last set of optimised parameters
                 self.starting_params = opt_parameters
                 # turn on the penalty
-                self.l_pen = 0.01
+                self.l_pen = 0.15
 
-                # optimise using the scipy method for the new structures with a penatly to remain close to the old
+                # optimise using the scipy method for the new structures with a penalty to remain close to the old
                 fitting_error, opt_parameters = self.scipy_optimiser()
 
                 # update the parameters in the fitting vector and the molecule for the MM scans
@@ -626,11 +549,9 @@ class TorsionOptimiser:
                 self.mm_energy = deepcopy(self.mm_energies())
 
                 self.optimiser_log.write(f'Results for fitting iteration: {iteration}\n')
+                self.optimiser_log.flush()
                 # plot the fitting graph this iteration
                 self.plot_results(name=f'SP_iter_{iteration}')
-
-                # now reset the energy's
-                self.qm_normalise(rel_to_optimised=True)
 
                 # move out of the folder
                 os.chdir('../')
@@ -651,61 +572,54 @@ class TorsionOptimiser:
 
         # gather the parameters with the lowest error, not always the last parameter set
         final_parameters = deepcopy(objective['parameters'][min_index])
+        # final_parameters = deepcopy(objective['parameters'][-1])
         final_error = objective['total'][min_index]
-        self.optimiser_log.write(f'The lowest error:{final_error}\nThe corresponding parameters:{final_parameters}\n')
+        # final_error = objective['total'][-1]
+        self.optimiser_log.write(f'The lowest error:{final_error}\nThe corresponding parameters:{final_parameters}\n'
+                                 f'were found on iteraion {min_index + 1}')
+        self.optimiser_log.flush()
 
         # now we want to see how well we have captured the initial QM energy surface
         # reset the scan coords to the initial values
         self.scan_coords = self.initial_coords
 
-        # get the energy surface for these final parameters
-        # this will also update the parameters in the molecule class so we can write a new xml
-        # first get back the original qm energies as well
-        self.qm_energy = self.energy_store_qm[:24]
-        self.qm_normalise(rel_to_optimised=True)
-        # energy_error = self.objective(final_parameters)
+        # Also save the last mm surface generated by the parameters
+        final_surface_energy = deepcopy(self.mm_energy)
+
+        # get the energy surface for these final parameters at the qm geometry
+        energy_error = self.objective(final_parameters)
+        self.optimiser_log.write(f'The final error at the qm optimised geometries is {energy_error}\n')
 
         # get the starting energies back to the initial values before fitting
         self.initial_energy = self.starting_energy
         # plot the results this is a graph of the starting QM surface and how well we can remake it
         self.optimiser_log.write('The final stage 2 fitting results:\n')
-        self.plot_results(name='Stage2_Single_point_fit')
+        self.optimiser_log.flush()
+        self.plot_results(name='Stage2_Single_point_fit',
+                          extra_points={'Final parameters MM geometry': final_surface_energy})
 
-        # self.convergence_plot('final_converge', objective)
+        # Plot the convergence of the energy rmsd and total errors
+        self.plot_convergence(objective)
+        # Plot the correlation between the single point energies over all structures sampled in the fitting
+        # Using the starting parameters and the final ones
+        self.plot_correlation(final_parameters)
 
         return final_error, final_parameters
 
-    def plot_correlation(self, name):
-        """Plot the single point energy correlation."""
-
-        # Make sure we have the same number of energy terms in the QM and MM lists
-        assert len(self.qm_energy) == len(self.mm_energy)
-
-        # adjust the mm_energy but do not alter
-        mm_energy = self.mm_energy - min(self.mm_energy)
-
-        # now we are just plotting them against each other they are already in the right order
-        plt.scatter(mm_energy, self.qm_energy)
-
-        plt.xlabel('Relative energy (kcal/mol) MM energy')
-        plt.ylabel('Relative energy (kcal/mol) QM energy')
-        plt.savefig(f'{name}.pdf')
-        plt.clf()
-
-    def qm_normalise(self, rel_to_optimised=False):
+    def qm_normalise(self):
         """
         Normalize the qm energy to the reference energy which is either the lowest in the set or the global minimum
-        :param rel_to_optimised: Normalise relative to the am optimised structure
         :return: normalised qm vector
         """
 
-        if rel_to_optimised:
-            self.qm_energy -= self.molecule.qm_energy  # make relative to the global minimum
+        if self.molecule.relative_to_global:
+            self.qm_energy -= self.molecule.qm_energy
+            print('Using the optimised structure!')
 
         else:
-            self.qm_energy -= min(self.qm_energy)  # make relative to lowest energy
+            self.qm_energy -= self.qm_energy.min()  # make relative to lowest energy
 
-        self.qm_energy *= 627.509  # convert to kcal/mol
+        self.qm_energy *= constants.HA_TO_KCAL_P_MOL
 
     def torsion_test(self):
         """
@@ -714,22 +628,17 @@ class TorsionOptimiser:
         """
 
         # Run the scanner
-        for i, self.scan in enumerate(self.molecule.rotatable):
-            print(f'Testing torsion {i} of {len(self.molecule.rotatable)}...', end='')
-
+        for i, self.scan in enumerate(self.molecule.scan_order):
             # move into the scan folder that should have been made
-            try:
-                os.mkdir(f'SCAN_{self.scan[0]}_{self.scan[1]}')
-
-            except FileExistsError:
-                pass
-
-            else:
-                os.chdir(f'SCAN_{self.scan[0]}_{self.scan[1]}')
+            make_and_change_into(f'SCAN_{self.scan[0]}_{self.scan[1]}')
 
             # Move into testing folder
-            os.mkdir('testing_torsion')
-            os.chdir('testing_torsion')
+            try:
+                rmtree('testing_torsion')
+            except FileNotFoundError:
+                pass
+
+            make_and_change_into('testing_torsion')
 
             # Run torsiondrive
             # step 2 MM torsion scan
@@ -740,16 +649,15 @@ class TorsionOptimiser:
             self.qm_energy = self.single_point()
 
             # Normalise the qm energy again using the qm reference energy
-            self.qm_normalise(rel_to_optimised=True)
+            self.qm_normalise()
 
             # Calculate the mm energy
+            self.reset_torsions()
             # Use the parameters to get the current energies
-            self.mm_energy = deepcopy(self.mm_energies())
+            self.mm_energy = deepcopy(self.starting_energy)
 
-            # For the graph:
-            self.initial_energy = self.mm_energy
             # Graph the energy
-            self.plot_results(name='testing_torsion')
+            self.plot_results(name='testing_torsion', torsion_test=True)
 
             os.chdir('../../')
 
@@ -761,28 +669,28 @@ class TorsionOptimiser:
 
         # Set up the first fitting
         for self.scan in self.scan_order:
-            self.optimiser_log.write(f'Optimising dihedrals for central bond {self.scan}\n')
-            # Get the MM coords from the QM torsion drive in openMM format
+            # Get the MM coords from the QM torsion drive in OpenMM format
             self.molecule.coords['traj'] = self.molecule.qm_scans[self.scan][1]
             self.scan_coords = self.molecule.openmm_coordinates(input_type='traj')
-
+            # This stores the results of the qm torsiondrive as the reference geometry should only be done once
+            if not self.rmsd_atoms:
+                self._create_rdkit_molecules(self.scan_coords)
             # Set up the fitting folders
             try:
-                rmtree(f'SCAN_{self.scan[0]}_{self.scan[1]}')
-            except FileNotFoundError:
-                pass
-            os.mkdir(f'SCAN_{self.scan[0]}_{self.scan[1]}')
+                os.mkdir(f'SCAN_{self.scan[0]}_{self.scan[1]}')
+            except FileExistsError:
+                # back up the old scan data
+                os.rename(f'SCAN_{self.scan[0]}_{self.scan[1]}', f'SCAN_{self.scan[0]}_{self.scan[1]}_backup')
+                os.mkdir(f'SCAN_{self.scan[0]}_{self.scan[1]}')
+
+            # Make and move through the folders  and create the log file
             os.chdir(f'SCAN_{self.scan[0]}_{self.scan[1]}')
-            try:
-                os.mkdir('Optimisation')
-            except FileExistsError:
-                pass
-            os.chdir('Optimisation')
-            try:
-                os.mkdir('First_fit')
-                os.mkdir('Refinement')
-            except FileExistsError:
-                pass
+            self.optimiser_log = open('Optimiser_log.txt', 'w')
+            self.optimiser_log.write(f'Starting dihedral optimisation at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}.\n')
+            self.optimiser_log.write(f'Optimising dihedrals for central bond {self.scan}\n')
+            self.optimiser_log.flush()
+            os.mkdir('First_fit')
+            os.mkdir('Refinement')
             os.chdir('First_fit')
 
             # Set the target energies first
@@ -794,27 +702,42 @@ class TorsionOptimiser:
             self.qm_energy = deepcopy(self.target_energy)
             # store the optimized qm energy and make all other energies relative to this one
 
-            self.qm_normalise(rel_to_optimised=True)
+            self.qm_normalise()
 
             # Keep the initial coords
             self.coords_store = deepcopy(self.scan_coords)
             self.initial_coords = deepcopy(self.scan_coords)
 
-            # Get the initial energies
-            self.initial_energies()
+            # Reset all torsions to their initial values
+            self.reset_torsions()
 
             # Get the torsions that will be fit and make the param vector
             self.get_torsion_params()
 
+            # Now measure the starting objective function
+            starting_error = deepcopy(self.objective(self.starting_params))
+            # initial is a reference to the energy surface at the start of the fit
+            self.initial_energy = deepcopy(self.mm_energy)
+            # starting energy is the surface made by the original unfit parameters
+            self.starting_energy = deepcopy(self.initial_energy)
+
             # Start the main optimiser loop and get the final error and parameters back
-            self.optimiser_log.write('Starting initial optimisation\n')
+            self.optimiser_log.write(f'Starting initial optimisation\nThe starting error is: {starting_error}\n')
+            self.optimiser_log.flush()
+            # Get the optimisation method if it is a hybrid take the first option
+            self.method = self.methods.get(self.molecule.opt_method.split('_')[0], None)
             error, opt_parameters = self.scipy_optimiser()
+            self.optimiser_log.write(f'fitted parameters {opt_parameters}\n')
+            self.optimiser_log.write(f'Fitted error {error}\n')
+            self.optimiser_log.flush()
+
             self.param_vector = opt_parameters
 
             # Push the new parameters back to the molecule parameter dictionary
             self.update_mol()
 
             self.optimiser_log.write('Optimisation finished\n')
+            self.optimiser_log.flush()
             # Plot the results of the first fit
             self.plot_results(name='Stage1_scipy')
 
@@ -823,6 +746,7 @@ class TorsionOptimiser:
 
             if self.refinement == 'SP':
                 self.optimiser_log.write('Starting refinement method single point matching\n')
+                self.optimiser_log.flush()
                 error, opt_parameters = self.single_point_matching(error, opt_parameters)
                 self.param_vector = opt_parameters
 
@@ -836,11 +760,13 @@ class TorsionOptimiser:
             # now move back to the starting directory
             os.chdir(self.home)
 
-        self.optimiser_log.close()
+            self.optimiser_log.write(f'Optimisation finished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}.\n')
+            self.optimiser_log.flush()
+            self.optimiser_log.close()
 
     def steepest_decent_refinement(self, x):
         """
-        A steepest decent optimiser as implemented in QUBEKit-V1, which will optimise the torsion terms
+        A steepest descent optimiser as implemented in QUBEKit-V1, which will optimise the torsion terms
         using full relaxed surface scans. SLOW!
         """
 
@@ -886,7 +812,7 @@ class TorsionOptimiser:
                 error_plus = self.objective(y_plus)
                 error[error_plus] = y_plus
 
-                # now make a differnt variation
+                # now make a different variation
                 y_minus = deepcopy(x)
                 y_minus[i] -= step_size[step_index]
                 print(f'y minus {y_minus}')
@@ -921,7 +847,7 @@ class TorsionOptimiser:
 
         return final_error, final_parameters
 
-    def rest_torsions(self):
+    def load_torsions(self):
         """
         Set all the torsion k values to one for every torsion in the system.
 
@@ -938,11 +864,11 @@ class TorsionOptimiser:
         # Set all the torsion to 1 to get them into the system
         for key in self.molecule.PeriodicTorsionForce:
             if self.molecule.PeriodicTorsionForce[key][-1] == 'Improper':
-                self.molecule.PeriodicTorsionForce[key] = [['1', '1', '0'], ['2', '1', '3.141592653589793'],
-                                                           ['3', '1', '0'], ['4', '1', '3.141592653589793'], 'Improper']
+                self.molecule.PeriodicTorsionForce[key] = [['1', '1', '0'], ['2', '1', f'{constants.PI}'],
+                                                           ['3', '1', '0'], ['4', '1', f'{constants.PI}'], 'Improper']
             else:
-                self.molecule.PeriodicTorsionForce[key] = [['1', '1', '0'], ['2', '1', '3.141592653589793'],
-                                                           ['3', '1', '0'], ['4', '1', '3.141592653589793']]
+                self.molecule.PeriodicTorsionForce[key] = [['1', '1', '0'], ['2', '1', f'{constants.PI}'],
+                                                           ['3', '1', '0'], ['4', '1', f'{constants.PI}']]
 
         # Write out the new xml file which is read into the OpenMM system
         self.molecule.write_parameters()
@@ -956,151 +882,77 @@ class TorsionOptimiser:
         make a vector corresponding to this size.
         """
 
-        # Get a list of which dihedrals parameters are to be varied
-        # Convert to be indexed from 0
-        to_fit = [(tor[0], tor[1], tor[2], tor[3]) for tor in list(self.molecule.dihedrals[self.scan])]
+        # Get a list of which dihedrals parameters are to be varied through the scanned bond
+        to_fit = [tuple(tor) for tor in list(self.molecule.dihedrals[self.scan])]
+        # Now expand to include all symmetry equivalent dihedrals
+        torsions_and_types = {}
+        for key, dihedral_class in self.molecule.dihedral_types.items():
+            for dihedral in dihedral_class:
+                if dihedral in to_fit or tuple(reversed(dihedral)) in to_fit:
+                    torsions_and_types[key] = dihedral_class
+                    # once the whole class is added move the next
+                    break
 
         # Check which ones have the same parameters and how many torsion vectors we need
         self.tor_types = OrderedDict()
 
+        # now populate the tor_types dict eg {0: [[(torsion key)], [starting param vector]
+        # [openMM system index of first torsion], [symmetry type]]
         i = 0
-        while to_fit:
-            # Get the current torsion
-            torsion = to_fit.pop(0)
-
-            # Get the torsions param vector used to compare to others
-            # The master vector could be backwards so try one way and if keyerror try the other
+        for symmetry_key, torsions in torsions_and_types.items():
+            torsion = torsions[0]
             try:
                 master_vector = [float(self.torsion_store[torsion][i][1]) for i in range(4)]
             except KeyError:
                 torsion = torsion[::-1]
                 master_vector = [float(self.torsion_store[torsion][i][1]) for i in range(4)]
 
-            # Add this type to the torsion type dictionary with the right key index
-            try:
-                self.tor_types[i] = [[torsion], master_vector, [self.index_dict[torsion]]]
-            except KeyError:
-                self.tor_types[i] = [[torsion], master_vector, [self.index_dict[tuple(reversed(torsion))]]]
-
-            to_remove = []
-            # Iterate over what is left of the list to see what other torsions are the same as the master
-            for dihedral in to_fit:
-                # Again, try both directions
+            self.tor_types[i] = [torsions, master_vector, [], symmetry_key]
+            # Now add in all of the openmm system parameter index
+            for torsion in torsions:
                 try:
-                    vector = [float(self.torsion_store[dihedral][i][1]) for i in range(4)]
+                    self.tor_types[i][2].append(self.index_dict[torsion])
                 except KeyError:
-                    dihedral = dihedral[::-1]
-                    vector = [float(self.torsion_store[dihedral][i][1]) for i in range(4)]
+                    self.tor_types[i][2].append(self.index_dict[tuple(reversed(torsion))])
 
-                # See if that vector is the same as the master vector
-                if vector == master_vector:
-                    try:
-                        self.tor_types[i][2].append(self.index_dict[dihedral])
-                        self.tor_types[i][0].append(dihedral)
-                    except KeyError:
-                        self.tor_types[i][2].append(self.index_dict[tuple(reversed(dihedral))])
-                        self.tor_types[i][0].append(tuple(reversed(dihedral)))
-                    to_remove.append(dihedral)
-
-            # Remove all of the dihedrals that have been matched
-            for dihedral in to_remove:
-                try:
-                    to_fit.remove(dihedral)
-                except ValueError:
-                    to_fit.remove(dihedral[::-1])
             i += 1
 
-        # Now that we have grouped by param vectors we need to compare the atom types that make up the torsions
-        # then if they are different we need to further split the torsions
-        # first construct the dictionary of type strings
-        torsion_string_dict = {}
-        for index, tor_info in self.tor_types.items():
-            for j, torsion in enumerate(tor_info[0]):
-                # get the tuple of the torsion string
-                tor_tup = tuple(self.molecule.atoms[torsion[i]].type for i in range(4))
-                # check if its in the torsion string dict
-                try:
-                    torsion_string_dict[tor_tup][0].append(torsion)
-                    torsion_string_dict[tor_tup][2].append(tor_info[2][j])
-                except KeyError:
-                    try:
-                        torsion_string_dict[tuple(reversed(tor_tup))][0].append(torsion)
-                        torsion_string_dict[tuple(reversed(tor_tup))][2].append(tor_info[2][j])
-                    except KeyError:
-                        torsion_string_dict[tor_tup] = [[torsion], tor_info[1], [tor_info[2][j]]]
-
-        self.tor_types = OrderedDict((index, k) for index, k in enumerate(torsion_string_dict.values()))
-
-        # Make the param_vector of the correct size
-        self.param_vector = np.zeros((1, 4 * len(self.tor_types)))
+        self.param_vector = np.array([0 for _ in range(4) for _ in range(len(self.tor_types))])
 
         # now take the master vectors and make the starting parameter list
         # Store the original parameter vectors to use regularisation
-        self.starting_params = [list(k)[1][i] for k in self.tor_types.values() for i in range(4)]
+        self.starting_params = np.array([list(k)[1][i] for k in self.tor_types.values() for i in range(4)])
+        self.optimiser_log.write(f'Starting parameters {self.starting_params}\n')
+        self.optimiser_log.flush()
 
-    def rmsd(self, qm_coordinates, mm_coodinates):
+    def _create_rdkit_molecules(self, coordinates):
+        """
+        Create a list of rdkit molecules corresponding to the coordinates of the qm torsionscan, these are used to compute
+        the rmsd.
+        :param coordinates: A list of numpy arrays used to generate the conformers
+        :return: a list of rdkit molecules each corresponding to a point on the torsionscan
         """
 
-        :param qm_coordinates: An array of the reference qm coordinates in openMM format
-        :param mm_coodinates: An array of the new mm coordinates in openMM format
-        :return: [bond rmsd, angles rmsd, torsions, rmsd]
+        for coord in coordinates:
+            rdkit_mol = deepcopy(self.molecule.rdkit_mol)
+            rdkit_mol.RemoveAllConformers()
+            rdkit_mol = RDKit().add_conformer(rdkit_mol, np.array(coord) * constants.NM_TO_ANGS)
+            self.rmsd_atoms.append(rdkit_mol)
+
+    def scan_rmsd(self, coordinates):
         """
-
-        bonds_rmsd = []
-        angles_rmsd = []
-        dihedrals_rmsd = []
-        # Each frame get the total rmsd for the components and put them in the list
-        for frame in zip(qm_coordinates, mm_coodinates):
-            # First convert each frame from openMM to Angstroms
-            self.molecule.coords['temp'] = np.array(frame[0]) * 10  # Convert to Angstroms
-            # QM first
-            self.molecule.get_bond_lengths(input_type='temp')
-            qm_bonds = self.molecule.bond_lengths
-            self.molecule.get_angle_values(input_type='temp')
-            qm_angles = self.molecule.angle_values
-            self.molecule.get_dihedral_values(input_type='temp')
-            qm_dihedrals = self.molecule.dih_phis
-
-            # Now get the MM measuremnts
-            self.molecule.coords['temp'] = np.array(frame[1]) * 10  # Convert to Angstroms
-            self.molecule.get_bond_lengths(input_type='temp')
-            mm_bonds = self.molecule.bond_lengths
-            self.molecule.get_angle_values(input_type='temp')
-            mm_angles = self.molecule.angle_values
-            self.molecule.get_dihedral_values(input_type='temp')
-            mm_dihedrals = self.molecule.dih_phis
-
-            # Now calculate the rmsd foreach component
-            bonds_rmsd.append(self.calculate_rmsd_component(qm_bonds, mm_bonds))
-            angles_rmsd.append(self.calculate_rmsd_component(qm_angles, mm_angles))
-            dihedrals_rmsd.append(self.calculate_rmsd_component(qm_dihedrals, mm_dihedrals))
-
-        # Now work out the average rmsd over all of the frames
-        bonds_rmsd = sum(bonds_rmsd) / len(bonds_rmsd)
-        angles_rmsd = sum(angles_rmsd) / len(angles_rmsd)
-        dihedrals_rmsd = sum(dihedrals_rmsd) / len(dihedrals_rmsd)
-
-        rmsd = {'bonds': bonds_rmsd,
-                'angles': angles_rmsd,
-                'dihedrals': dihedrals_rmsd,
-                'total': bonds_rmsd + angles_rmsd + dihedrals_rmsd}
+        Calculate the rmsd between the stored qm positions and the new set of coordinates
+        :param coordinates:  A list of numpy coordinate arrays
+        :return: a list containing the rmsd values for each pair of coordinates
+        """
+        # Make sure the amount of coordinates we pass is the same as the amount of reference positions that we have
+        assert len(coordinates) == len(self.rmsd_atoms)
+        rmsd = []
+        for coord, molecule in zip(coordinates, self.rmsd_atoms):
+            molecule = RDKit().add_conformer(molecule, np.array(coord) * constants.NM_TO_ANGS)
+            rmsd.append(RDKit().get_conformer_rmsd(molecule, 0, molecule.GetNumConformers() - 1))
 
         return rmsd
-
-    def calculate_rmsd_component(self, reference, component):
-        """
-        Calculate the rmsd value for the input component
-        :param reference: The reference values bonds, angles, dihedrals dicts
-        :param component: The mm values to be compared
-        :return: The rmsd value calculated
-        """
-
-        rmsd = []
-        # Reference is a dict of measurements
-        for key, value in reference.items():
-            rmsd.append((value - component[key]) ** 2)
-
-        return np.sqrt(sum(rmsd) / len(rmsd))
 
     def finite_difference(self, x):
         """Compute the gradient of changing the parameter vector using central difference scheme."""
@@ -1120,17 +972,26 @@ class TorsionOptimiser:
         """The main torsion parameter optimiser that controls the optimisation method used."""
 
         print(f'Running SciPy {self.method} optimiser ... ')
+        # TODO all methods should use bounds which can control the amount of vn we fit
 
         if self.method == 'Nelder-Mead':
-            res = minimize(self.objective, self.param_vector, method='Nelder-Mead',
-                           options={'xtol': self.x_tol, 'ftol': self.error_tol, 'disp': True})
+            res = minimize(self.objective, self.param_vector, method=self.method,
+                           options={'xtol': self.x_tol, 'ftol': self.error_tol, 'disp': True, 'maxiter': 10000})
 
         elif self.method == 'BFGS':
-            res = minimize(self.objective, self.param_vector, method='BFGS', jac=self.finite_difference,
+            res = minimize(self.objective, self.param_vector, method=self.method, jac=self.finite_difference,
                            options={'disp': True})
 
+        elif self.method == 'Genetic':
+            # We must create some bounds for this method based on the vn_limits
+            print(self.param_vector)
+            bounds = [(-abs(self.abs_bounds), abs(self.abs_bounds)) for _ in range(len(self.param_vector))]
+            print(bounds)
+            res = differential_evolution(self.objective, bounds=bounds)
+
         else:
-            raise NotImplementedError('The optimisation method is not implemented')
+            raise NotImplementedError(
+                'This optimisation method is not implemented; options are: Nelder-Mead, BFGS, Genetic.')
 
         print('SciPy optimisation complete')
 
@@ -1143,8 +1004,8 @@ class TorsionOptimiser:
     def update_torsions(self):
         """Update the torsions being fitted."""
 
-        forces = {self.openMM.simulation.system.getForce(index).__class__.__name__: self.openMM.simulation.system.getForce(index) for
-                  index in range(self.openMM.simulation.system.getNumForces())}
+        forces = {self.open_mm.simulation.system.getForce(index).__class__.__name__: self.open_mm.simulation.system.getForce(index) for
+                  index in range(self.open_mm.simulation.system.getNumForces())}
         torsion_force = forces['PeriodicTorsionForce']
 
         for val in self.tor_types.values():
@@ -1154,64 +1015,160 @@ class TorsionOptimiser:
                         index=v_n + val[2][j], periodicity=v_n + 1, phase=self.phases[v_n], k=val[1][v_n],
                         particle1=dihedral[0], particle2=dihedral[1], particle3=dihedral[2], particle4=dihedral[3]
                     )
-        torsion_force.updateParametersInContext(self.openMM.simulation.context)
+        torsion_force.updateParametersInContext(self.open_mm.simulation.context)
 
-        return self.openMM
+        return self.open_mm
 
-    def plot_results(self, name='Plot', validate=False):
-        """Plot the results of the scan."""
+    def plot_results(self, name='Plot', torsion_test=False, extra_points=None):
+        """
+        Plot the results of the scan.
+        :param name: Name of the pdf made
+        :param torsion_test: changes the style of the plot for testing
+        :param extra_points: a dictionary of label's and extra points to plot
+        :return:
+        """
 
         # Make sure we have the same number of energy terms in the QM and MM lists
         assert len(self.qm_energy) == len(self.mm_energy)
 
         # Adjust the MM energies
-        plot_mm_energy = self.mm_energy - min(self.mm_energy)
+        if self.molecule.relative_to_global:
+            if torsion_test:
+                initial_energy = self.mm_energy - self.open_mm.get_energy(self.opt_coords)
+                plot_mm_energy = initial_energy
+            else:
+                plot_mm_energy = self.mm_energy - self.open_mm.get_energy(self.opt_coords)
+                initial_energy = self.initial_energy - self.open_mm.get_energy(self.opt_coords)
 
-        # Adjust the initial MM energies
-        initial_energy = self.initial_energy - min(self.initial_energy)
-
-        # Construct the angle array
-        angles = [x for x in range(-165, 195, self.molecule.increment)]
-        points = [x for x in range(len(self.qm_energy))] if len(self.qm_energy) > len(angles) else None
-
-        if points is not None:
-            # Print a table of the results for multiple plots
-            print(f'Geometry    QM(relative)        MM(relative)    MM_initial(relative)')
-            for i in points:
-                print(f'{i:4}  {self.qm_energy[i]:15.10f}     {plot_mm_energy[i]:15.10f}    {initial_energy[i]:15.10f}')
-
-            # Plot the qm and mm data
-            plt.plot(points, self.qm_energy, 'o', label='QM')
-            plt.plot(points, initial_energy, label='MM initial')
-            plt.plot(points, plot_mm_energy, label=f'MM final')
-
-            plt.xlabel('Geometry')
+            if extra_points is not None:
+                for key, val in extra_points.items():
+                    extra_points[key] = val - self.open_mm.get_energy(self.opt_coords)
 
         else:
-            # Print a table of the results
-            self.optimiser_log.write(f'Angle    QM(relative)        MM(relative)    MM_initial(relative)\n')
-            for pos, angle in enumerate(angles):
-                self.optimiser_log.write(f'{angle:4}  {self.qm_energy[pos]:15.10f}     {plot_mm_energy[pos]:15.10f}    '
-                                         f'{initial_energy[pos]:15.10f}\n')
-
-            plt.xlabel(r'Dihedral angle$^{\circ}$')
-
-            # Plot the qm and mm data
-            plt.plot(angles, self.qm_energy, 'o', label='QM data')
-            if not validate:
-                plt.plot(angles, initial_energy, label='Starting parameters', linestyle='--')
-                plt.plot(angles, plot_mm_energy, label='Final parameters')
-
+            if torsion_test:
+                initial_energy = self.mm_energy - self.mm_energy.min()
+                plot_mm_energy = initial_energy
             else:
-                plt.plot(angles, plot_mm_energy, label='MM validate')
+                plot_mm_energy = self.mm_energy - self.mm_energy.min()
+                initial_energy = self.initial_energy - self.initial_energy.min()
+
+            if extra_points is not None:
+                for key, val in extra_points.items():
+                    extra_points[key] = val - val.min()
+
+        # Construct the angle array
+        angles = list(range(self.molecule.dih_start, self.molecule.dih_end + self.molecule.increment, self.molecule.increment))
+
+        # Make sure we have the same angles as data points
+        assert len(angles) == len(self.qm_energy)
+        # Print a table of the results
+        if torsion_test:
+            self.optimiser_log.write(f'Angle    QM(relative)        MM_initial(relative)\n')
+            self.optimiser_log.flush()
+            for data in zip(angles, self.qm_energy, initial_energy):
+                self.optimiser_log.write(f'{data[0]:4}  {data[1]:15.10f}     {data[2]:15.10f}\n')
+                self.optimiser_log.flush()
+        else:
+            self.optimiser_log.write(f'Angle    QM(relative)        MM(relative)    MM_initial(relative)\n')
+            self.optimiser_log.flush()
+            for data in zip(angles, self.qm_energy, plot_mm_energy, initial_energy):
+                self.optimiser_log.write(f'{data[0]:4}  {data[1]:15.10f}     {data[2]:15.10f}    {data[3]:15.10f}\n')
+                self.optimiser_log.flush()
+
+        plt.xlabel(r'Dihedral angle$^{\circ}$')
+
+        # Plot the qm and mm data
+        plt.plot(angles, self.qm_energy, 'o', label='QM data')
+        if torsion_test:
+            plt.plot(angles, initial_energy, label='Current parameters')
+        else:
+            plt.plot(angles, initial_energy, label='Starting parameters', linestyle='--')
+            plt.plot(angles, plot_mm_energy, label='Final parameters')
+            if extra_points is not None:
+                for title, values in extra_points.items():
+                    plt.plot(angles, values, label=title)
 
         # Label the graph and save the pdf
-        plt.title(f'Relative energy surface for dihedral {self.molecule.dihedrals[self.scan][0][0]}-'
-                  f'{self.molecule.dihedrals[self.scan][0][1]}-'
-                  f'{self.molecule.dihedrals[self.scan][0][2]}-{self.molecule.dihedrals[self.scan][0][3]}')
+        mol_di = self.molecule.dihedrals[self.scan][0]
+        plt.title(f'Relative energy surface for dihedral {mol_di[0]}-{mol_di[1]}-{mol_di[2]}-{mol_di[3]}')
         plt.ylabel('Relative energy (kcal/mol)')
         plt.legend(loc=1)
         plt.savefig(f'{name}.pdf')
+        plt.clf()
+
+    def plot_correlation(self, optimised_parameters):
+        """Plot the single point energy correlation between all points in the fitting"""
+
+        # First get every qm energy and coordinate from the stores and measure all energies relative to
+        # the qm optimised structure
+        # rel_to_global = deepcopy(self.molecule.relative_to_global)
+        # self.molecule.relative_to_global = True
+        # self.qm_energy = deepcopy(self.energy_store_qm)
+        # self.qm_normalise()
+        self.scan_coords = deepcopy(self.coords_store[:24])
+
+        # Calculate the mm energies of all of the structures with the new torsion parameters
+        self.objective(optimised_parameters)
+        mm_energy_new = self.mm_energy - self.mm_energy.min()
+        slope_new, intercept_new, r_value_new, _, _ = linregress(self.qm_energy, mm_energy_new)
+
+        # Calculate the error using the old parameters
+        self.objective(self.starting_params)
+        mm_energy_old = self.mm_energy - self.mm_energy.min()
+        slope_old, intercept_old, r_value_old, _, _ = linregress(self.qm_energy, mm_energy_old)
+
+        # Make sure we have the same number of energy terms in the QM and MM lists
+        assert len(self.qm_energy) == len(mm_energy_new)
+        assert len(self.qm_energy) == len(mm_energy_old)
+
+        # now we are just plotting them against each other they are already in the right order
+        plt.scatter(self.qm_energy, mm_energy_old, label=rf'starting parameters $r^2$={r_value_old ** 2:.4f}', s=10)
+        plt.scatter(self.qm_energy, mm_energy_new, label=rf'Final parameters $r^2$={r_value_new ** 2:.4f}', s=10)
+        x = np.linspace(self.qm_energy.min(), self.qm_energy.max(), 100)
+        mm_min = min(mm_energy_new.min(), mm_energy_old.min())
+        mm_max = max(mm_energy_new.max(), mm_energy_old.max())
+        y = np.linspace(mm_min, mm_max, 100)
+        # Line x = y
+        plt.plot(x, y, ls="--", c=".3", zorder=2)
+
+        plt.xlabel('Relative energy (kcal/mol) QM energy')
+        plt.ylabel('Relative energy (kcal/mol) MM energy')
+        plt.legend(loc=1)
+        plt.savefig(f'correlation_plot.pdf')
+        plt.clf()
+
+        # reset the relative to global setting
+        # self.molecule.relative_to_global = rel_to_global
+
+    def plot_convergence(self, objective):
+        """
+        Plot the convergence of the errors through the iterative fitting methods
+        :param objective: A dictionary containing all of the error measurements
+        :return: None
+        """
+
+        iterations = [x for x in range(len(objective['total']))]
+        fig, ax1 = plt.subplots()
+
+        color = 'tab:red'
+        ax1.set_xlabel('Fitting iteration')
+        ax1.set_ylabel('Error (kcal / mol)', color=color)
+        ax1.plot(iterations, objective['energy_error'], label='Energy error', color=color, linestyle='--')
+        ax1.plot(iterations, objective['total'], label='Total error', color=color)
+        ax1.tick_params(axis='y', labelcolor=color)
+
+        color = 'tab:blue'
+        ax2 = ax1.twinx()
+        ax2.plot(iterations, objective['rmsd'], label='RMSD error', color=color)
+        ax2.set_ylabel('RMSD', color=color)
+        ax2.tick_params(axis='y', labelcolor=color)
+        # get the plotted lines and labels from matplotlib to combine the legend
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc=1)
+
+        fig.tight_layout()
+        plt.savefig(f'convergence.pdf')
         plt.clf()
 
     def make_constraints(self):
@@ -1221,8 +1178,8 @@ class TorsionOptimiser:
             mol_di = self.molecule.dihedrals[self.scan][0]
             constraint.write(f'$scan\ndihedral {mol_di[0]} {mol_di[1]} {mol_di[2]} {mol_di[3]} -165.0 180 24\n')
 
-            if self.molecule.constraint_file:
-                with open(self.molecule.constraint_file) as cons_file:
+            if self.molecule.constraints_file:
+                with open(self.molecule.constraints_file) as cons_file:
                     for line in cons_file:
                         constraint.write(line)
 
@@ -1230,7 +1187,8 @@ class TorsionOptimiser:
         """Write out the torsion drive dihedral file for the current self.scan."""
 
         with open('dihedrals.txt', 'w+') as out:
-            out.write('# dihedral definition by atom indices starting from 0\n#zero_based_numbering\n# i     j     k     l\n')
+            out.write('# dihedral definition by atom indices starting from 0\n#zero_based_numbering'
+                      '\n# i     j     k     l\n')
             mol_di = self.molecule.dihedrals[self.scan][0]
             out.write(f'  {mol_di[0]}     {mol_di[1]}     {mol_di[2]}     {mol_di[3]}\n')
 
@@ -1239,14 +1197,14 @@ class TorsionOptimiser:
 
         # Write an xml file with the new parameters
 
-        # Move into a temporary folder torsion drive gives an error if we use tempdirectory module
+        # Move into a temporary folder torsion drive gives an error if we use temp directory module
         temp = f'{engine}_scan'
         try:
             rmtree(temp)
         except FileNotFoundError:
             pass
-        os.mkdir(temp)
-        os.chdir(temp)
+
+        make_and_change_into(temp)
 
         # Write out a pdb file of the qm optimised geometry
         self.molecule.write_pdb(name='openmm')
@@ -1258,22 +1216,22 @@ class TorsionOptimiser:
                 if self.molecule.constraints_file is not None:
                     os.system('mv ../constraints.txt .')
                 self.write_dihedrals()
-                sp.run(f'torsiondrive-launch -e openmm openmm.pdb dihedrals.txt '
+                sp.run(f'torsiondrive-launch -e openmm openmm.pdb dihedrals.txt -v '
                        f'{self.molecule.constraints_file if self.molecule.constraints_file is not None else ""}',
-                       shell=True, stderr=log, stdout=log)
+                       shell=True, stderr=log, stdout=log, check=True)
                 self.molecule.read_tdrive(self.scan)
                 self.molecule.coords['traj'] = self.molecule.qm_scans[self.scan][1]
-                positions = self.molecule.openMM_coordinates(input_type='traj')
+                positions = self.molecule.openmm_coordinates(input_type='traj')
             elif engine == 'geometric':
                 if self.molecule.constraints_file is not None:
                     os.system('mv ../constraints.txt .')
                 else:
                     self.make_constraints()
                 sp.run('geometric-optimize --reset --epsilon 0.0 --maxiter 500 --qccnv --pdb openmm.pdb '
-                       '--openmm state.xml qube_constraints.txt', shell=True, stdout=log, stderr=log)
+                       '--openmm state.xml qube_constraints.txt', shell=True, stdout=log, stderr=log, check=True)
                 positions = self.molecule.read_xyz('scan.xyz')
             else:
-                raise NotImplementedError
+                raise NotImplementedError('Invalid torsion engine. Please use torsiondrive or geometric')
 
         # move back to the master folder
         os.chdir('../')
@@ -1284,19 +1242,20 @@ class TorsionOptimiser:
     def single_point(self):
         """Take set of coordinates of a molecule and do a single point calculation; returns an array of the energies."""
 
-        sp_energy = []
-        # reset the temp entry in the moleule
+        # reset the temp entry in the molecule
         self.molecule.coords['temp'] = self.molecule.coords['input']
         # for each coordinate in the system we need to write a qm input file and get the single point energy
         try:
-            rmtree(f'Single_points')
+            rmtree('Single_points')
         except FileNotFoundError:
             pass
-        os.mkdir('Single_points')
-        os.chdir('Single_points')
+
+        make_and_change_into('Single_points')
+
+        sp_energy = []
+
         for i, x in enumerate(self.scan_coords):
-            os.mkdir(f'SP_{i}')
-            os.chdir(f'SP_{i}')
+            make_and_change_into(f'SP_{i}')
             print(f'Doing single point calculations on new structures ... {i + 1}/{len(self.scan_coords)}')
             # now we need to change the positions of the molecule in the molecule array
             for y, coord in enumerate(x):

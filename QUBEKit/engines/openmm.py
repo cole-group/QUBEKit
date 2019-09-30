@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
-from QUBEKit.decorators import for_all_methods, timer_logger
-from QUBEKit.helpers import append_to_log
+from QUBEKit.utils import constants
+from QUBEKit.utils.decorators import timer_logger
 
 import numpy as np
 
@@ -14,7 +14,6 @@ import xml.etree.ElementTree as ET
 from copy import deepcopy
 
 
-@for_all_methods(timer_logger)
 class OpenMM:
     """This class acts as a wrapper around OpenMM so we can many basic functions using the class"""
 
@@ -22,11 +21,12 @@ class OpenMM:
         self.molecule = molecule
         self.system = None
         self.simulation = None
-        self.combination = None
+        self.combination = molecule.combination
         self.pdb = molecule.name + '.pdb'
         self.xml = molecule.name + '.xml'
         self.openmm_system()
 
+    @timer_logger
     def openmm_system(self):
         """Initialise the OpenMM system we will use to evaluate the energies."""
 
@@ -41,26 +41,26 @@ class OpenMM:
         # check if we have opls combination rules if the xml is present
         try:
             self.combination = ET.fromstring(xmlstr).find('NonbondedForce').attrib['combination']
-            append_to_log('OPLS combination rules found in xml file', msg_type='minor')
         except AttributeError:
             pass
         except KeyError:
             pass
 
         if self.combination == 'opls':
+            print('OPLS combination rules found in xml file')
             self.opls_lj()
 
-        temperature = 298.15 * unit.kelvin
+        temperature = constants.STP * unit.kelvin
         integrator = mm.LangevinIntegrator(temperature, 5 / unit.picoseconds, 0.001 * unit.picoseconds)
 
         self.simulation = app.Simulation(modeller.topology, self.system, integrator)
         self.simulation.context.setPositions(modeller.positions)
 
-    def get_energy(self, position, forces=False):
+    # get_energy is called too many times so timer_logger decorator should not be applied.
+    def get_energy(self, position):
         """
         Return the MM calculated energy of the structure
         :param position: The OpenMM formatted atomic positions
-        :param forces: If we should also get the forces
         :return:
         """
 
@@ -68,17 +68,13 @@ class OpenMM:
         self.simulation.context.setPositions(position)
 
         # Get the energy from the new state
-        state = self.simulation.context.getState(getEnergy=True, getForces=forces)
+        state = self.simulation.context.getState(getEnergy=True)
 
         energy = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
 
-        if forces:
-            gradient = state.getForces(asNumpy=True)
-
-            return energy, gradient
-
         return energy
 
+    @timer_logger
     def opls_lj(self):
         """
         This function changes the standard OpenMM combination rules to use OPLS, execp and normal pairs are only
@@ -138,6 +134,7 @@ class OpenMM:
             #             eps = sqrt(epsilon1 * epsilon2)
             #             nonbonded_force.setExceptionParameters(i, p1, p2, q, sig14, eps)
 
+    @timer_logger
     def format_coords(self, coordinates):
         """
         Take the coordinates as a list and format to the OpenMM style of a list of tuples.
@@ -151,6 +148,7 @@ class OpenMM:
 
         return coords
 
+    @timer_logger
     def calculate_hessian(self, finite_step):
         """
         Using finite displacement calculate the hessian matrix of the molecule using symmetric difference quotient (SQD) rule.
@@ -159,7 +157,7 @@ class OpenMM:
         """
 
         # Create the OpenMM coords list from the qm coordinates and convert to nm
-        input_coords = self.molecule.coords['qm'].flatten() / 10
+        input_coords = self.molecule.coords['qm'].flatten() * constants.ANGS_TO_NM
 
         # We get each hessian element from = [E(dx + dy) + E(-dx - dy) - E(dx - dy) - E(-dx + dy)] / 4 dx dy
         hessian = np.zeros((3 * len(self.molecule.atoms), 3 * len(self.molecule.atoms)))
@@ -175,7 +173,7 @@ class OpenMM:
                     coords = deepcopy(input_coords)
                     coords[i] -= 2 * finite_step
                     e2 = self.get_energy(self.format_coords(coords))
-                    hessian[i, j] = (e1 + e2) / (4 * finite_step**2 * self.molecule.atoms[i // 3].mass)
+                    hessian[i, j] = (e1 + e2) / (4 * finite_step**2 * self.molecule.atoms[i // 3].atomic_mass)
                 else:
                     coords = deepcopy(input_coords)
                     coords[i] += finite_step
@@ -193,12 +191,13 @@ class OpenMM:
                     coords[i] -= finite_step
                     coords[j] += finite_step
                     e4 = self.get_energy(self.format_coords(coords))
-                    hessian[i, j] = (e1 + e2 - e3 - e4) / (4 * finite_step**2 * self.molecule.atoms[i // 3].mass)
+                    hessian[i, j] = (e1 + e2 - e3 - e4) / (4 * finite_step ** 2 * self.molecule.atoms[i // 3].atomic_mass)
 
         # Now make the matrix symmetric
         sym_hessian = hessian + hessian.T - np.diag(hessian.diagonal())
         return sym_hessian
 
+    @timer_logger
     def normal_modes(self, finite_step):
         """
         Calculate the normal modes of the molecule from the hessian matrix

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
-from QUBEKit.decorators import for_all_methods, timer_logger
 from QUBEKit.engines.base_engine import Engines
-from QUBEKit.helpers import append_to_log, get_overage, check_symmetry
+from QUBEKit.utils import constants
+from QUBEKit.utils.decorators import for_all_methods, timer_logger
+from QUBEKit.utils.helpers import append_to_log, check_symmetry
+from QUBEKit.utils.exceptions import Psi4Error
 
 import subprocess as sp
 
@@ -22,20 +24,35 @@ class PSI4(Engines):
 
         self.functional_dict = {'pbepbe': 'PBE', 'wb97xd': 'wB97X-D'}
         # Search for functional in dict, if it's not there, just leave the theory as it is.
-        self.molecule.theory = self.functional_dict.get(self.molecule.theory, self.molecule.theory)
+        self.molecule.theory = self.functional_dict.get(self.molecule.theory.lower(), self.molecule.theory)
+
+        # Test if PSI4 is callable
+        try:
+            sp.run('psi4 -h', shell=True, check=True, stdout=sp.PIPE)
+        except sp.CalledProcessError:
+            raise ModuleNotFoundError(
+                'PSI4 not working. Please ensure PSI4 is installed and can be called with the command: psi4')
+
+        if self.molecule.geometric:
+            try:
+                sp.run('geometric-optimize -h', shell=True, check=True, stdout=sp.PIPE)
+            except sp.CalledProcessError:
+                raise ModuleNotFoundError(
+                    'Geometric not working. Please ensure geometric is installed and can be called '
+                    'with the command: geometric-optimize')
 
     # TODO add restart from log method
-    def generate_input(self, input_type='input', optimise=False, hessian=False, density=False, energy=False,
-                       fchk=False, restart=False, execute=True):
+    def generate_input(self, input_type='input', optimise=False, hessian=False, density=False,
+                       energy=False, fchk=False, restart=False, execute=True):
         """
         Converts to psi4 input format to be run in psi4 without using geometric.
         :param input_type: The coordinate set of the molecule to be used
-        :param optimise: Optimise the molecule to the desired convergence critera with in the iteration limit
+        :param optimise: Optimise the molecule to the desired convergence criterion within the iteration limit
         :param hessian: Calculate the hessian matrix
         :param density: Calculate the electron density
         :param energy: Calculate the single point energy of the molecule
         :param fchk: Write out a gaussian style Fchk file
-        :param restart: Restart the calculation from a log point
+        :param restart: Restart the calculation from a log point (required but unused to match g09's generate_input())
         :param execute: Run the desired Psi4 job
         :return: The completion status of the job True if successful False if not run or failed
         """
@@ -61,13 +78,14 @@ class PSI4(Engines):
             tasks += '\nwfn.hessian().print_out()\n\n'
 
         if density:
-            append_to_log('Writing PSI4 density calculation input', 'minor')
-            setters += " cubeprop_tasks ['density']\n"
-
-            overage = get_overage(self.molecule.name)
-            setters += ' CUBIC_GRID_OVERAGE [{0}, {0}, {0}]\n'.format(overage)
-            setters += ' CUBIC_GRID_SPACING [0.13, 0.13, 0.13]\n'
-            tasks += f"grad, wfn = gradient('{self.molecule.theory.lower()}', return_wfn=True)\ncubeprop(wfn)"
+            pass
+        #     append_to_log('Writing PSI4 density calculation input', 'minor')
+        #     setters += " cubeprop_tasks ['density']\n"
+        #
+        #     overage = get_overage(self.molecule.name)
+        #     setters += ' CUBIC_GRID_OVERAGE [{0}, {0}, {0}]\n'.format(overage)
+        #     setters += ' CUBIC_GRID_SPACING [0.13, 0.13, 0.13]\n'
+        #     tasks += f"grad, wfn = gradient('{self.molecule.theory.lower()}', return_wfn=True)\ncubeprop(wfn)"
 
         if fchk:
             append_to_log('Writing PSI4 input file to generate fchk file')
@@ -76,7 +94,8 @@ class PSI4(Engines):
             tasks += f'\nfchk_writer.write("{self.molecule.name}_psi4.fchk")\n'
 
         # TODO If overage cannot be made to work, delete and just use Gaussian.
-        # if self.molecule.solvent:
+        if self.molecule.solvent:
+            pass
         #     setters += ' pcm true\n pcm_scf_type total\n'
         #     tasks += '\n\npcm = {'
         #     tasks += '\n units = Angstrom\n Medium {\n  SolverType = IEFPCM\n  Solvent = Chloroform\n }'
@@ -95,7 +114,8 @@ class PSI4(Engines):
                              f'{self.molecule.charge} {self.molecule.multiplicity} \n')
             # molecule is always printed
             for i, atom in enumerate(self.molecule.coords[input_type]):
-                input_file.write(f' {self.molecule.atoms[i].element}    {float(atom[0]): .10f}  {float(atom[1]): .10f}  {float(atom[2]): .10f} \n')
+                input_file.write(f' {self.molecule.atoms[i].atomic_symbol}    '
+                                 f'{float(atom[0]): .10f}  {float(atom[1]): .10f}  {float(atom[2]): .10f} \n')
 
             input_file.write(f" units angstrom\n no_reorient\n}}\n\nset {{\n basis {self.molecule.basis}\n")
 
@@ -104,7 +124,10 @@ class PSI4(Engines):
 
         if execute:
             with open('log.txt', 'w+') as log:
-                sp.run(f'psi4 input.dat -n {self.molecule.threads}', shell=True, stdout=log, stderr=log)
+                try:
+                    sp.run(f'psi4 input.dat -n {self.molecule.threads}', shell=True, stdout=log, stderr=log, check=True)
+                except sp.CalledProcessError:
+                    raise Psi4Error('Psi4 did not execute successfully check log file for details.')
 
             # Now check the exit status of the job
             return self.check_for_errors()
@@ -127,9 +150,8 @@ class PSI4(Engines):
                     return {'success': False,
                             'error': 'Not known'}
 
-            else:
-                return {'success': False,
-                        'error': 'Segfault'}
+            return {'success': False,
+                    'error': 'Segfault'}
 
     def hessian(self):
         """
@@ -188,7 +210,7 @@ class PSI4(Engines):
             hess_matrix = np.array(reshaped)
 
             # Cache the unit conversion.
-            conversion = 627.509391 / (0.529 ** 2)
+            conversion = constants.HA_TO_KCAL_P_MOL / (constants.BOHR_TO_ANGS ** 2)
             # Element-wise multiplication
             hess_matrix *= conversion
 
@@ -253,8 +275,8 @@ class PSI4(Engines):
             for line in log:
                 if 'Total Energy =' in line:
                     return float(line.split()[3])
-            else:
-                raise EOFError('Cannot find energy in output.dat file.')
+
+        raise EOFError('Cannot find energy in output.dat file.')
 
     def all_modes(self):
         """Extract all modes from the psi4 output file."""
@@ -299,10 +321,12 @@ class PSI4(Engines):
 
         with open(f'{self.molecule.name}.psi4in', 'w+') as file:
 
-            file.write(f'memory {self.molecule.memory} GB\n\nmolecule {self.molecule.name} {{\n {self.molecule.charge} {self.molecule.multiplicity} \n')
+            file.write(f'memory {self.molecule.memory} GB\n\nmolecule {self.molecule.name} {{\n {self.molecule.charge} '
+                       f'{self.molecule.multiplicity} \n')
 
             for i, atom in enumerate(molecule):
-                file.write(f'  {self.molecule.atoms[i].element:2}    {float(atom[0]): .10f}  {float(atom[1]): .10f}  {float(atom[2]): .10f}\n')
+                file.write(f'  {self.molecule.atoms[i].atomic_symbol:2}    '
+                           f'{float(atom[0]): .10f}  {float(atom[1]): .10f}  {float(atom[2]): .10f}\n')
 
             file.write(f' units angstrom\n no_reorient\n}}\nset basis {self.molecule.basis}\n')
 

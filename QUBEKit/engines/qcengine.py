@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
-from QUBEKit.decorators import for_all_methods, timer_logger
 from QUBEKit.engines.base_engine import Engines
-from QUBEKit.helpers import check_symmetry
+from QUBEKit.utils import constants
+from QUBEKit.utils.decorators import for_all_methods, timer_logger
+from QUBEKit.utils.helpers import check_symmetry
 
-import qcengine as qcng
 import qcelemental as qcel
+import qcengine as qcng
 
 import numpy as np
 
@@ -28,7 +29,7 @@ class QCEngine(Engines):
         mol_data = f'{self.molecule.charge} {self.molecule.multiplicity}\n'
 
         for i, coord in enumerate(self.molecule.coords[input_type]):
-            mol_data += f'{self.molecule.atoms[i].element} '
+            mol_data += f'{self.molecule.atoms[i].atomic_symbol} '
             for item in coord:
                 mol_data += f'{item} '
             mol_data += '\n'
@@ -61,7 +62,8 @@ class QCEngine(Engines):
 
             if driver == 'hessian':
                 hess_size = 3 * len(self.molecule.atoms)
-                hessian = np.reshape(ret.return_result, (hess_size, hess_size)) * 627.509391 / (0.529 ** 2)
+                conversion = constants.HA_TO_KCAL_P_MOL / (constants.BOHR_TO_ANGS ** 2)
+                hessian = np.reshape(ret.return_result, (hess_size, hess_size)) * conversion
                 check_symmetry(hessian)
 
                 return hessian
@@ -89,11 +91,9 @@ class QCEngine(Engines):
                 },
                 'initial_molecule': mol,
             }
-            # TODO hide the output stream so it does not spoil the terminal printing
-            ret = qcng.compute_procedure(
+            return qcng.compute_procedure(
                 geo_task, 'geometric', return_dict=True, local_options={'memory': self.molecule.memory,
                                                                         'ncores': self.molecule.threads})
-            return ret
 
         else:
             raise KeyError('Invalid engine type provided. Please use "geo" or "psi4".')

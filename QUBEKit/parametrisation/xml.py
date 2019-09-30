@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
-from QUBEKit.decorators import for_all_methods, timer_logger
 from QUBEKit.parametrisation.base_parametrisation import Parametrisation
+from QUBEKit.utils.decorators import for_all_methods, timer_logger
 
 from simtk.openmm import app, XmlSerializer
 
@@ -26,13 +26,7 @@ class XML(Parametrisation):
         pdb = app.PDBFile(f'{self.molecule.name}.pdb')
         modeller = app.Modeller(pdb.topology, pdb.positions)
 
-        if self.input_file:
-            forcefield = app.ForceField(self.input_file)
-        else:
-            try:
-                forcefield = app.ForceField(self.molecule.name + '.xml')
-            except FileNotFoundError:
-                raise FileNotFoundError('No .xml type file found.')
+        forcefield = app.ForceField(self.input_file if self.input_file else f'{self.molecule.name}.xml')
 
         system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
-from QUBEKit.decorators import for_all_methods, timer_logger
-from QUBEKit.helpers import check_net_charge
+from QUBEKit.utils import constants
+from QUBEKit.utils.decorators import for_all_methods, timer_logger
+from QUBEKit.utils.helpers import check_net_charge, set_net
 
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 import os
 
 import numpy as np
@@ -22,15 +23,11 @@ class LennardJones:
 
         self.ddec_data = []
 
-        # Sigma: Angs -> nm
-        self.sigma_conversion = 0.1
+        self.epsilon_conversion = constants.BOHR_TO_ANGS ** 6
+        self.epsilon_conversion *= constants.HA_TO_KCAL_P_MOL
+        self.epsilon_conversion *= constants.KCAL_TO_KJ
 
-        # Epsilon: (Ha * (Bohr ** 6)) / (Angs ** 6) -> kJ / mol
-        # (Ha * (Bohr ** 6)) / (Angs ** 6) -> Ha = * 0.529177 ** 6
-        # Ha -> kcal / mol = * 627.509
-        # kcal / mol -> kJ / mol = * 4.184
-        # PI = 57.65240039
-        self.epsilon_conversion = 57.65240039
+        self.sigma_conversion = constants.ANGS_TO_NM
 
         self.non_bonded_force = {}
 
@@ -58,7 +55,6 @@ class LennardJones:
                 ' point to that location.')
 
         with open(net_charge_file_name, 'r+') as charge_file:
-
             lines = charge_file.readlines()
 
         # Find number of atoms
@@ -83,7 +79,6 @@ class LennardJones:
         r_cubed_file_name = 'DDEC_atomic_Rcubed_moments.xyz'
 
         with open(r_cubed_file_name, 'r+') as vol_file:
-
             lines = vol_file.readlines()
 
         vols = [float(line.split()[-1]) for line in lines[2:atom_total + 2]]
@@ -95,13 +90,13 @@ class LennardJones:
         """
         From ONETEP output files, extract the necessary parameters for calculation of L-J.
         Desired format:
-        ['atom number', 'atom type', 'x', 'y', 'z', 'charge', 'vol']
-        All vals are float except atom number (int) and atom type (str).
+        ['atomic number', 'atomic name', 'x', 'y', 'z', 'charge', 'vol']
+        All vals are float except atom number (int) and atom name (str).
         """
 
         # We know this from the molecule object self.molecule try to get the info from there
         for atom in self.molecule.atoms:
-            self.ddec_data.append([atom.atom_index + 1, atom.element] +
+            self.ddec_data.append([atom.atom_index + 1, atom.atomic_symbol] +
                                   [self.molecule.coords['input'][atom.atom_index][i] for i in range(3)])
 
         # TODO Just move the ddec.onetep file instead? Handle this in run file?
@@ -141,33 +136,38 @@ class LennardJones:
         """
 
         # Beware weird units, (wrong in the paper too).
-        # 'elem' : [vfree, bfree, rfree]
-        # Units: [vfree: Bohr ** 3, bfree: Ha * (Bohr ** 6), rfree: Angs]
+        # Units: vfree: Bohr ** 3, bfree: Ha * (Bohr ** 6), rfree: Angs
 
+        FreeParams = namedtuple('params', 'vfree bfree rfree')
         elem_dict = {
-            'H': [7.6, 6.5, 1.64],
-            'C': [34.4, 46.6, 2.08],
-            'N': [25.9, 24.2, 1.72],
-            'B': [46.7, 99.5, 2.08],
-            'O': [22.1, 15.6, 1.60],
-            'F': [18.2, 9.5, 1.58],
-            'P': [84.6, 185, 2.00],
-            'S': [75.2, 134.0, 2.00],
-            'Cl': [65.1, 94.6, 1.88],
-            'Br': [95.7, 162.0, 1.96],
+            'H': FreeParams(7.6, 6.5, 1.64),
+            'B': FreeParams(46.7, 99.5, 2.08),
+            'C': FreeParams(34.4, 46.6, 2.08),
+            'N': FreeParams(25.9, 24.2, 1.72),
+            'O': FreeParams(22.1, 15.6, 1.60),
+            'F': FreeParams(18.2, 9.5, 1.58),
+            'P': FreeParams(84.6, 185, 2.07),
+            'S': FreeParams(75.2, 134.0, 2.00),
+            'Cl': FreeParams(65.1, 94.6, 1.88),
+            'Br': FreeParams(95.7, 162.0, 1.96),
+            'Si': FreeParams(101.64, 305, 2.00),
         }
 
         for pos, atom in enumerate(self.ddec_data):
+            try:
+                atomic_name, atom_vol = atom[1], atom[-1]
+                # r_aim = r_free * ((vol / v_free) ** (1 / 3))
+                r_aim = elem_dict[atomic_name].rfree * ((atom_vol / elem_dict[atomic_name].vfree) ** (1 / 3))
 
-            # r_aim = r_free * ((vol / v_free) ** (1 / 3))
-            r_aim = elem_dict[f'{atom[1]}'][2] * ((atom[-1] / elem_dict[f'{atom[1]}'][0]) ** (1 / 3))
+                # b_i = bfree * ((vol / v_free) ** 2)
+                b_i = elem_dict[atomic_name].bfree * ((atom_vol / elem_dict[atomic_name].vfree) ** 2)
 
-            # b_i = bfree * ((vol / v_free) ** 2)
-            b_i = elem_dict[f'{atom[1]}'][1] * ((atom[-1] / elem_dict[f'{atom[1]}'][0]) ** 2)
+                a_i = 32 * b_i * (r_aim ** 6)
 
-            a_i = 32 * b_i * (r_aim ** 6)
+                self.ddec_data[pos] += [r_aim, b_i, a_i]
 
-            self.ddec_data[pos] += [r_aim, b_i, a_i]
+            except KeyError:
+                self.ddec_data[pos] += [0, 0, 0]
 
     def calculate_sig_eps(self):
         """
@@ -182,10 +182,7 @@ class LennardJones:
 
         for pos, atom in enumerate(self.ddec_data):
 
-            if atom[-1] == 0:
-                sigma = epsilon = 0
-
-            else:
+            if atom[-1]:
                 # sigma = (a_i / b_i) ** (1 / 6)
                 sigma = (atom[-1] / atom[-2]) ** (1 / 6)
                 sigma *= self.sigma_conversion
@@ -194,7 +191,10 @@ class LennardJones:
                 epsilon = (atom[-2] ** 2) / (4 * atom[-1])
                 epsilon *= self.epsilon_conversion
 
-            self.non_bonded_force[pos] = [str(atom[5]), str(sigma), str(epsilon)]
+            else:
+                sigma = epsilon = 0
+
+            self.non_bonded_force[pos] = [atom[5], sigma, epsilon]
 
     def correct_polar_hydrogens(self):
         """
@@ -212,12 +212,12 @@ class LennardJones:
         # Find all the polar hydrogens and store their positions / atom numbers
         polars = []
         for pair in new_pairs:
-            if 'O' == pair[0].element or 'N' == pair[0].element or 'S' == pair[0].element:
-                if 'H' == pair[1].element:
+            if 'O' == pair[0].atomic_symbol or 'N' == pair[0].atomic_symbol or 'S' == pair[0].atomic_symbol:
+                if 'H' == pair[1].atomic_symbol:
                     polars.append(pair)
 
-            if 'O' == pair[1].element or 'N' == pair[1].element or 'S' == pair[1].element:
-                if 'H' == pair[0].element:
+            if 'O' == pair[1].atomic_symbol or 'N' == pair[1].atomic_symbol or 'S' == pair[1].atomic_symbol:
+                if 'H' == pair[0].atomic_symbol:
                     polars.append(pair)
 
         # Find square root of all b_i values so that they can be added easily according to paper's formula.
@@ -226,8 +226,8 @@ class LennardJones:
 
         if polars:
             for pair in polars:
-                if 'H' == pair[0].element or 'H' == pair[1].element:
-                    if 'H' == pair[0].element:
+                if 'H' == pair[0].atomic_symbol or 'H' == pair[1].atomic_symbol:
+                    if 'H' == pair[0].atomic_symbol:
                         polar_h_pos = pair[0].atom_index
                         polar_son_pos = pair[1].atom_index
                     else:
@@ -250,32 +250,46 @@ class LennardJones:
         for pos, atom in enumerate(self.ddec_data):
 
             if atom[-1] == 0:
-                epsilon, self.non_bonded_force[pos][1] = 0, str(0)
+                epsilon, self.non_bonded_force[pos][1] = 0, 0
             else:
                 # epsilon = (b_i ** 2) / (4 * a_i)
                 epsilon = (atom[-2] ** 2) / (4 * atom[-1])
                 epsilon *= self.epsilon_conversion
 
-            self.non_bonded_force[pos] = [str(atom[5]), self.non_bonded_force[pos][1], str(epsilon)]
+            self.non_bonded_force[pos] = [atom[5], self.non_bonded_force[pos][1], epsilon]
 
     def apply_symmetrisation(self):
-        """Using the atoms picked out to be symmetrised apply the symmetry to the charge, sigma and epsilon values"""
+        """
+        Using the atoms picked out to be symmetrised,
+        apply the symmetry to the charge, sigma and epsilon values.
+        """
+
+        atom_types = {}
+        for key, val in self.molecule.atom_symmetry_classes.items():
+            atom_types.setdefault(val, []).append(key)
 
         # get the values to be symmetrised
-        for sym_set in self.molecule.symm_hs.values():
+        for sym_set in atom_types.values():
             charges, sigmas, epsilons = [], [], []
-            for atom_set in sym_set:
-                for atom in atom_set:
-                    charges.append(float(self.non_bonded_force[atom][0]))
-                    sigmas.append(float(self.non_bonded_force[atom][1]))
-                    epsilons.append(float(self.non_bonded_force[atom][2]))
+            if len(sym_set) > 1:
+                for atom in sym_set:
+                    charges.append(self.non_bonded_force[atom][0])
+                    sigmas.append(self.non_bonded_force[atom][1])
+                    epsilons.append(self.non_bonded_force[atom][2])
 
                 # calculate the average values to be used in symmetry
                 charge, sigma, epsilon = sum(charges) / len(charges), sum(sigmas) / len(sigmas), sum(epsilons) / len(epsilons)
 
                 # Loop through the atoms again and store the new values
-                for atom in atom_set:
-                    self.non_bonded_force[atom] = [str(charge), str(sigma), str(epsilon)]
+                for atom in sym_set:
+                    self.non_bonded_force[atom] = [round(charge, 6), round(sigma, 6), round(epsilon, 6)]
+
+        # make sure the net charge is correct for the current precision
+        charges = [non_bonded[0] for non_bonded in self.non_bonded_force.values()]
+        new_charges = set_net(charges, self.molecule.charge, 6)
+        # Put the new charges back into the holder
+        for non_bonded in zip(self.non_bonded_force.values(), new_charges):
+            non_bonded[0][0] = non_bonded[1]
 
     def extract_extra_sites(self):
         """
@@ -299,6 +313,7 @@ class LennardJones:
 
         sites = OrderedDict()
         sites_no = 0
+
         for i, line in enumerate(lines[2:]):
             # get the current element
             element = str(line.split()[0])
@@ -315,16 +330,16 @@ class LennardJones:
                         # get parent index number for the topology network
                         parent = i - sites_no
                         # get the two closest atoms to the parent
-                        closet_atoms = list(self.molecule.topology.neighbors(parent))
-                        if len(closet_atoms) < 2:
+                        closest_atoms = list(self.molecule.topology.neighbors(parent))
+                        if len(closest_atoms) < 2:
                             # find another atom if we only have one
                             # dont want to get the parent as a close atom
-                            closet_atoms.append(list(self.molecule.topology.neighbors(closet_atoms[0]))[-1])
+                            closest_atoms.append(list(self.molecule.topology.neighbors(closest_atoms[0]))[-1])
 
                         # Get the xyz coordinates of the reference atoms
                         parent_pos = self.molecule.coords['qm'][parent]
-                        close_a = self.molecule.coords['qm'][closet_atoms[0]]
-                        close_b = self.molecule.coords['qm'][closet_atoms[1]]
+                        close_a = self.molecule.coords['qm'][closest_atoms[0]]
+                        close_b = self.molecule.coords['qm'][closest_atoms[1]]
 
                         # work out the local coordinates site using rules from the OpenMM guide
                         orig = w1o * parent_pos + w2o * close_a + close_b * w3o
@@ -343,7 +358,7 @@ class LennardJones:
                         charge = float(pos_site.split()[4])
 
                         # store the site info [(parent top no, a, b), (p1, p2, p3), charge]]
-                        sites[sites_no] = [(parent, closet_atoms[0], closet_atoms[1]), (p1 / 10, p2 / 10, p3 / 10), charge]
+                        sites[sites_no] = [(parent, closest_atoms[0], closest_atoms[1]), (p1 / 10, p2 / 10, p3 / 10), charge]
                         sites_no += 1
 
         self.molecule.sites = sites
@@ -352,8 +367,8 @@ class LennardJones:
         for site in sites.values():
             charge, sigma, eps = self.non_bonded_force[site[0][0]]
             # Change the charge on the first entry
-            charge = float(charge) - site[2]
-            self.non_bonded_force[site[0][0]] = [str(charge), sigma, eps]
+            charge -= site[2]
+            self.non_bonded_force[site[0][0]] = [charge, sigma, eps]
 
     def calculate_non_bonded_force(self):
         """
