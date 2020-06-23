@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
+from QUBEKit.lennard_jones import LennardJones
 from QUBEKit.ligand import Protein
 from QUBEKit.parametrisation import XMLProtein
-from QUBEKit.lennard_jones import LennardJones
-from QUBEKit.protein_tools import qube_general, pdb_reformat, get_water
+from QUBEKit.proteins.protein_tools import get_water, pdb_reformat, qube_general
 
 import argparse
 from functools import partial
@@ -27,11 +27,10 @@ def main():
         """This class is called when we setup a new protein."""
 
         def __call__(self, pars, namespace, values, option_string=None):
-            """This function is executed when setup is called."""
 
             printf('starting protein prep, reading pdb file...')
             protein = Protein(values)
-            printf(f'{len(protein.Residues)} residues found!')
+            printf(f'{len(protein.residues)} residues found!')
             # TODO find the magic numbers for the box for onetep
             protein.write_xyz(name='protein')
             printf(f'protein.xyz file made for ONETEP\n Run this file')
@@ -41,29 +40,25 @@ def main():
         """This class handles the building of the protein xml and pdb files."""
 
         def __call__(self, pars, namespace, values, option_string=None):
-            """This function is executed when build is called."""
 
             pro = Protein(values)
             # print the QUBE general FF to use in the parametrisation
             qube_general()
             # now we want to add the connections and parametrise the protein
             XMLProtein(pro)
-            # this updates the bonded info that is now in the object
 
             # finally we need the non-bonded parameters from onetep
             # TODO should we also have the ability to get DDEC6 charges from the cube file?
             pro.charge = 0
             pro.charges_engine = 'onetep'
             pro.density_engine = 'onetep'
-            lj = LennardJones(pro)
-            pro.NonbondedForce = lj.calculate_non_bonded_force()
+            LennardJones(pro).calculate_non_bonded_force()
 
-            # now we write out the final parameters
-            # we should also calculate the charges and lj at this point!
+            # Write out the final parameters
             printf('Writing pdb file with connections...')
-            pro.write_pdb(name='QUBE_pro')
+            pro.write_pdb(name=f'QUBE_pro_{pro.name}')
             printf('Writing XML file for the system...')
-            pro.write_parameters(name='QUBE_pro', is_protein=True)
+            pro.write_parameters(name=f'QUBE_pro_{pro.name}')
             # now remove the qube general file
             os.remove('QUBE_general_pi.xml')
             printf('Done')
@@ -81,7 +76,7 @@ def main():
         """This class converts the names in a qube taj file to match the reference."""
 
         def __call__(self, pars, namespace, values, option_string=None):
-            """This function is executed when water is called."""
+            """This function is executed when convert is called."""
             reference, target = values
             printf(reference, target)
             printf(f'Rewriting input: {target} to match: {reference}...')

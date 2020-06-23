@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from QUBEKit.utils import constants
+
 from collections import OrderedDict
 from copy import deepcopy
 
@@ -53,10 +54,15 @@ class Parametrisation:
 
         # could be a problem for boron compounds
         self.molecule.AtomTypes = {}
-        self.molecule.HarmonicBondForce = {bond: [0, 0] for bond in self.molecule.bond_lengths.keys()}
-        self.molecule.HarmonicAngleForce = {angle: [0, 0] for angle in self.molecule.angle_values.keys()}
+        try:
+            self.molecule.HarmonicBondForce = {bond: [0, 0] for bond in self.molecule.bond_lengths.keys()}
+            self.molecule.HarmonicAngleForce = {angle: [0, 0] for angle in self.molecule.angle_values.keys()}
+        except AttributeError:
+            self.molecule.HarmonicBondForce = {}
+            self.molecule.HarmonicAngleForce = {}
         self.molecule.NonbondedForce = OrderedDict((number, [0, 0, 0]) for number in range(len(self.molecule.atoms)))
         self.molecule.PeriodicTorsionForce = OrderedDict()
+        self.sites = {}
 
     def __repr__(self):
         return f'{self.__class__.__name__}({self.__dict__!r})'
@@ -76,6 +82,13 @@ class Parametrisation:
         try:
             in_root = ET.parse('serialised.xml').getroot()
 
+            # Extract any virtual site data only supports local coords atm, charges are added later
+            for i, virtual_site in enumerate(in_root.iter('LocalCoordinatesSite')):
+                self.sites[i] = [
+                    (int(virtual_site.get('p1')), int(virtual_site.get('p2')), int(virtual_site.get('p3'))),
+                    (float(virtual_site.get('pos1')), float(virtual_site.get('pos2')), float(virtual_site.get('pos3')))
+                ]
+
             # Extract all bond data
             for Bond in in_root.iter('Bond'):
                 bond = (int(Bond.get('p1')), int(Bond.get('p2')))
@@ -92,12 +105,20 @@ class Parametrisation:
                 else:
                     self.molecule.HarmonicAngleForce[angle[::-1]] = [float(Angle.get('a')), float(Angle.get('k'))]
 
-            # Extract all non-bonded data
-            i = 0
+            # Extract all non-bonded data, do not add virtual site info to the nonbonded list
+            atom_num, site_num = 0, 0
             for Atom in in_root.iter('Particle'):
                 if "eps" in Atom.attrib:
-                    self.molecule.NonbondedForce[i] = [float(Atom.get('q')), float(Atom.get('sig')), float(Atom.get('eps'))]
-                    i += 1
+                    if atom_num >= len(self.molecule.atoms):
+                        self.sites[site_num].append(float(Atom.get('q')))
+                        site_num += 1
+                    else:
+                        self.molecule.NonbondedForce[atom_num] = [float(Atom.get('q')), float(Atom.get('sig')), float(Atom.get('eps'))]
+                        self.molecule.atoms[atom_num].partial_charge = float(Atom.get('q'))
+                        atom_num += 1
+
+            # Check if we found any sites
+            self.molecule.extra_sites = self.sites or None
 
             # Extract all of the torsion data
             for Torsion in in_root.iter('Torsion'):
@@ -122,7 +143,7 @@ class Parametrisation:
                 raise FileNotFoundError('Molecule could not be serialised from OpenMM')
         # Now we have all of the torsions from the OpenMM system
         # we should check if any torsions we found in the molecule do not have parameters
-        # if they don't give them the default 0 parameter this will not change the energy
+        # if they don't, give them the default 0 parameter this will not change the energy
         if self.molecule.dihedrals is not None:
             for tor_list in self.molecule.dihedrals.values():
                 for torsion in tor_list:
@@ -167,7 +188,6 @@ class Parametrisation:
             for improper, params in improper_torsions.items():
                 if len(params) != 1:
                     # Now we have to sum the k values across the same terms
-                    # sum the ka values
                     new_params = params[0]
                     for values in params[1:]:
                         for i in range(4):

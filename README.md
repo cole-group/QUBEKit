@@ -3,11 +3,10 @@
 #### **Newcastle University UK - Cole Group**
 
 
-| **Status** | [![Language grade: Python](https://img.shields.io/lgtm/grade/python/g/qubekit/QUBEKit.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/qubekit/QUBEKit/context:python) [![Build Status](https://travis-ci.com/qubekit/QUBEKit.svg?branch=master)](https://travis-ci.com/qubekit/QUBEKit) [![Anaconda-Server Badge](https://anaconda.org/cringrose/qubekit/badges/version.svg)](https://anaconda.org/cringrose/qubekit) |
+| **Status** | [![Language grade: Python](https://img.shields.io/lgtm/grade/python/g/qubekit/QUBEKit.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/qubekit/QUBEKit/context:python) [![Build Status](https://travis-ci.com/qubekit/QUBEKit.svg?branch=master)](https://travis-ci.com/qubekit/QUBEKit) [![Conda (channel only)](https://img.shields.io/conda/vn/conda-forge/qubekit?color=blue&logo=anaconda&logoColor=white)](https://anaconda.org/conda-forge/qubekit) |
 | :------ | :------ |
-| **Foundation** | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python Version](https://img.shields.io/badge/Python-3.6+-1f425f.svg)](https://www.python.org/) [![platforms](https://img.shields.io/badge/Platform-Linux%20x64-orange.svg)]() |
-| **Installation** | [![Anaconda-Server Badge](https://anaconda.org/cringrose/qubekit/badges/installer/conda.svg)](https://anaconda.org/cringrose) [![Anaconda-Server Badge](https://anaconda.org/cringrose/qubekit/badges/downloads.svg)](https://anaconda.org/cringrose/qubekit) [![Anaconda-Server Badge](https://anaconda.org/cringrose/qubekit/badges/latest_release_date.svg)](https://anaconda.org/cringrose/qubekit)
-
+| **Foundation** | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python Version](https://img.shields.io/badge/Python-3.6+-1f425f.svg)](https://www.python.org/) [![platforms](https://anaconda.org/conda-forge/qubekit/badges/platforms.svg)]() |
+| **Installation** | [![Anaconda-Server Badge](https://anaconda.org/conda-forge/qubekit/badges/installer/conda.svg)](https://anaconda.org/conda-forge/qubekit) [![Anaconda-Server Badge](https://anaconda.org/conda-forge/qubekit/badges/downloads.svg)](https://anaconda.org/conda-forge/qubekit) [![Anaconda-Server Badge](https://anaconda.org/conda-forge/qubekit/badges/latest_release_date.svg)](https://anaconda.org/conda-forge/qubekit) |
 
 ## Table of Contents
 
@@ -51,27 +50,28 @@ While it is stable we are constantly working to improve the code and broaden its
 
 We use lots of software written by many different people;
 if reporting a bug please (to the best of your ability) make sure it is a bug with QUBEKit and not with a dependency.
-We welcome any suggestions for additions or changes. 
+We welcome any suggestions for additions or changes.
 
 ## Installation
 
-To install, it is possible to use git, pip or conda *([help](https://github.com/qubekit/QUBEKit#requirements))*.
-Git has our latest version which will likely have newer features but may not be stable.
+QUBEKit is now available through conda-forge; this is the recommended installation method.
+Github has our latest version which will likely have newer features but may not be stable.
+Pip is not updated as regularly as Anaconda or Github but should also be stable.
 
-We recommend installing via conda. This will install all necessary dependencies.
-
-    git clone https://github.com/qubekit/QUBEKit.git
-    cd <install location>
-    python setup.py install
+    # Recommended
+    conda install -c conda-forge qubekit
 
 ---
     
+    # Alternative 
     pip install qubekit
 
 ---
-
-    conda install -c cringrose qubekit
     
+    # Recommended for Developers (see below)
+    git clone https://github.com/qubekit/QUBEKit.git
+    cd <install location>
+    python setup.py install    
 
 ### Requirements
 
@@ -96,67 +96,31 @@ If you do, please make sure Gaussian09 is executable with the command `g09`.
 Chargemol can be downloaded and installed from a zip file in the above link. 
 Be sure to add the path to the QUBEKit configs once you've generated them *([explanation](https://github.com/qubekit/QUBEKit#before-you-start-config-files))*.
 
-**Core Requirements**
+Most conda packages are included in the conda-forge install.
+Packages not available through conda-forge may need to be installed separately.
 
-All conda packages are included in the conda install:
+    conda install -c conda-forge qubekit
 
-`conda install -c cringrose qubekit`
+The following table details some of the core requirements included in the conda install of QUBEKit.
+If any packages are missing from the install or causing issues, this table shows how to get them.
 
-Below details some of the core requirements included in the conda install of QUBEKit.
+| **Package** | Conda Install |
+| :------ | :------ |
+| [GeomeTRIC](https://github.com/leeping/geomeTRIC) | `conda install -c conda-forge geometric` |
+| [OpenForceField](https://openforcefield.org/) | `conda install -c omnia openforcefield` |
+| [OpenMM](http://openmm.org/) | `conda install -c omnia openmm` |
+| [PSI4](http://www.psicode.org/) | `conda install -c psi4 psi4` |
+| [QCEngine](https://pypi.org/project/qcengine/) | `conda install -c conda-forge qcengine` |
+| [RDKit](http://rdkit.org/) | `conda install -c rdkit rdkit` |
+| [TorsionDrive](https://github.com/lpwgroup/torsiondrive) | `conda install -c conda-forge torsiondrive` |
 
----
-
-* [PSI4](http://www.psicode.org/)
-
-`conda install -c psi4 psi4`
-
-* [GeomeTRIC](https://github.com/leeping/geomeTRIC)
-
-`conda install -c conda-forge geometric` 
-
-* [OpenMM](http://openmm.org/)
-
-`conda install -c omnia openmm`
-
-* [RDKit](http://rdkit.org/)
-
-`conda install -c rdkit rdkit`
-
-* [OpenForceField](https://openforcefield.org/)
-
-`conda install -c omnia openforcefield`
-
-* [QCEngine](https://pypi.org/project/qcengine/)
-
-`pip install qcengine`
-
-* [TorsionDrive](https://github.com/lpwgroup/torsiondrive)
-
-`conda install -c conda-forge torsiondrive`
-
-* [Ambermini](https://github.com/swails/ambermini)
-
-`conda install -c omnia ambermini`
-
-
-**GUI Requirements**
-
-* [PyQt5](https://pypi.org/project/PyQt5/)
-
-`pip install PyQt5`
-
-* [PyQtWebEngine 5.12.1](https://pypi.org/project/PyQtWebEngine/)
-
-`pip install PyQtWebEngine`
-
----
 
 Adding lots of packages can be a headache. If possible, install using Anaconda through the terminal.
 This is generally safest, as Anaconda should deal with versions and conflicts in your environment.
 Generally, conda packages will have the conda install command on their website or github.
 For the software not available through Anaconda, or if Anaconda is having trouble resolving conflicts, either git clone them and install:
 
-    git clone http://<git_address_here>
+    git clone https://<git_address_here>
     cd <location of cloned package>
     python setup.py install
 
@@ -169,13 +133,13 @@ the easiest method is install via conda, then remove the conda version of qubeki
 This is accomplished with a few simple commands:
     
     # Install QUBEKit as normal
-    conda install -c cringrose qubekit
+    conda install -c conda-forge qubekit
     
     # Remove ONLY the QUBEKit package itself, leaving all dependencies installed
-    # and on their correct version
+    # and on the correct version
     conda remove --force qubekit
     
-    # Re-download QUBEKit outside of conda
+    # Re-download the latest QUBEKit through github
     git clone https://github.com/qubekit/QUBEKit.git
     
     # Re-install QUBEKit outside of conda
@@ -386,22 +350,21 @@ For a single molecule analysis, this is achieved with the `-end` and `-restart` 
 
 The stages are:
 
-* **parametrise** - The molecule is parametrised using OpenFF, AnteChamber or XML.
-This step also loads in the molecule and extracts key information like the atoms and their coordinates. 
-* **mm_optimise** - This is a quick, preliminary optimisation which speeds up later optimisations.
-* **qm_optimise** - This is the main optimisation stage, default method is to use PSI4 with GeomeTRIC.
-* **hessian** - This again uses PSI4 to calculate the Hessian matrix which is needed for calculating bonding parameters.
-* **mod_sem** - Using the Hessian matrix, the bonds and angles terms are calculated with the Modified Seminario Method.
-* **density** - The density is calculated using Gaussian09. This is where the solvent is applied as well (if configured). 
-* **charges** - The charges are partitioned and calculated using Chargemol with DDEC3 or 6.
-* **lennard_jones** - The charges are extracted and Lennard-Jones parameters calculated, ready to produce an XML.
-* **torsion_scan** - Using the molecule's geometry, a torsion scan is performed.
-The molecule can then be optimised with respect to these parameters.
-* **torsion_optimise** - The optimisation step for the torsional analysis.
-* **finalise** - This step (which is always performed, regardless of end-point) produces an XML for the molecule.
-This stage also prints the final information to the log file and a truncated version to the terminal.
+| Stage | Description |
+| :---: | --- |
+| *parametrise* | The molecule is parametrised using OpenFF, AnteChamber or an xml file. This step also loads in the molecule and extracts key information like the atoms and their coordinates. |
+| *mm_optimise* | This is a quick, preliminary optimisation which speeds up later optimisations. (This stage is skippable.) |
+| *qm_optimise* | This is the main quantum mechanical optimisation stage; default method is to use PSI4 with GeomeTRIC. |
+| *hessian* | This again uses PSI4 or Gaussian to calculate the Hessian matrix which is needed for calculating bonding parameters. |
+| *mod_sem* | Using the Hessian matrix, the bond lengths, angles and force constants are calculated with the Modified Seminario Method. |
+| *density* | The density is calculated using Gaussian09. This is where the solvent is applied as well (if configured). | 
+| *charges* | The charges are partitioned and calculated using Chargemol with DDEC3 or 6. |
+| *lennard_jones* | The charges are extracted and Lennard-Jones parameters (sigma and epsilon) are calculated. |
+| *torsion_scan* | Using the molecule's geometry, a torsion scan is performed. The molecule can then be optimised with respect to these parameters. |
+| *torsion_optimise* | The fitting and optimisation step for the torsional analysis. |
+| *finalise* | This step (which is always performed, regardless of end-point) produces an xml file for the molecule. This stage also prints the final information to the log file and a truncated version to the terminal. |
 
-In a normal run, all of these stages are called sequentially,
+In a normal run, all of these stages are executed sequentially,
 but with `-end` and `-restart` you are free to run *from* any step *to* any step inclusively.
 
 When using `-end`, simply specify the end-point in the proceeding command (default `finalise`),
@@ -507,11 +470,14 @@ To display the progress of all analyses in your current directory and below, use
     
 QUBEKit will find the log files in all QUBEKit directories and display a colour-coded table of the progress.  
 
-* Tick marks indicate a stage has completed successfully
-* Tildes indicate a stage has not finished nor errored
-* An S indicates a stage has been skipped
-* An E indicates that a stage has started and failed for some reason. 
-Viewing the log file will give more information as to *why* it failed.
+| Indicator | Meaning |
+| :---: | :---: |
+| ✓ |  Completed successfully |
+| ~ | Neither finished nor errored |
+| S | Skipped |
+| E | Started and failed for some reason |
+
+Viewing the QUBEKit log file will give more information as to *why* it failed.
 
 ### QUBEKit Commands: Other Commands and Information
 
@@ -537,35 +503,19 @@ this means they may try to take more than is available, leading to a crash.
 
 All commands can be viewed by calling `QUBEKit -h`. Below is an explanation of what all these commands are:
 
-* Enable or disable GeomeTRIC (bool): 
-`-geo true` or `-geo false`
-
-* Change DDEC version (int; 3 or 6): 
-`-ddec 3` or `-ddec 6`
-
-* Enable or disable the solvent model (bool): 
-`-solvent true` or `-solvent false`
-
-* Change the method for initial parametrisation (str; openff, xml or antechamber): 
-`-param openff`, `-param xml`, `-param antechamber`
-
-* Change the log file name and directory label (str; any):
-`-log Example123`
-
-* Change the functional being used (str; any valid psi4/g09 functional):
-`-func B3LYP`
-
-* Change the basis set (str; any valid psi4/g09 basis set):
-`-basis 6-31G`
-
-* Change the vibrational scaling used with the basis set (float; e.g. 0.997):
-`-vib 0.967`
-
-* Change the amount of memory allocated (int; do not exceed computer's limits!):
-`-memory 4`
-
-* Change the number of threads allocated (int; do not exceed computer's limits!):
-`-threads 4`
+| Command | Type | Description |
+| --- | --- | --- |
+| `-geo` | Bool: `True`, `true`, `t`, `False`, `false`, `f` | Enable or disable GeomeTRIC |
+| `-ddec` | Int: `3`, `6` | Change DDEC version |
+| `-solvent` | Bool | Enable or disable the solvent model |
+| `-param` | String: `antechamber`, `openff`, `xml`  | Change the method for initial parametrisation |
+| `-log` | String: `<arbitrary alphanumeric>` | Change the log file name and directory label |
+| `-func` | String: `<any valid PSI4/Gaussian functional` | Change the functional being used |
+| `-basis` | String: `<any valid PSI4/Gaussian basis set` | Change the basis set |
+| `-vib` | Float: `0.0 - 1.0` | Change the vibrational scaling used with the basis set |
+| `-memory` | Int: `1 - PC limit` | Change the amount of memory allocated |
+| `-threads` | Int: `1 - PC limit` | Change the number of threads allocated |
+| `-v` | Bool | Change the verbosity of the output |
 
 ---
 

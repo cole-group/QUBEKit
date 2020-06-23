@@ -22,15 +22,19 @@ class ModSemMaths:
         return f'{self.__class__.__name__}({self.__dict__!r})'
 
     @staticmethod
-    def unit_vector_n(u_bc, u_ab):
-        """Calculates unit normal vector which is perpendicular to plane abc."""
+    def unit_vector_normal_to_bond(u_bc, u_ab):
+        """Calculates unit vector which is normal to the plane abc."""
 
-        return np.cross(u_bc, u_ab) / np.linalg.norm(np.cross(u_bc, u_ab))
+        cross = np.cross(u_bc, u_ab)
+
+        return cross / np.linalg.norm(cross)
 
     @staticmethod
-    def vector_along_bond(coords, bond):
+    def unit_vector_along_bond(coords, bond):
+        """Calculates the unit vector along a bond."""
 
-        diff_ab = coords[bond[1], :] - coords[bond[0], :]
+        atom_a, atom_b = bond
+        diff_ab = coords[atom_b] - coords[atom_a]
 
         return diff_ab / np.linalg.norm(diff_ab)
 
@@ -40,12 +44,12 @@ class ModSemMaths:
 
         atom_a, atom_b, atom_c = angle
 
-        u_ab = ModSemMaths.vector_along_bond(coords, (atom_a, atom_b))
-        u_cb = ModSemMaths.vector_along_bond(coords, (atom_c, atom_b))
+        u_ab = ModSemMaths.unit_vector_along_bond(coords, (atom_a, atom_b))
+        u_cb = ModSemMaths.unit_vector_along_bond(coords, (atom_c, atom_b))
 
-        u_n = ModSemMaths.unit_vector_n(u_cb, u_ab)
+        u_n = ModSemMaths.unit_vector_normal_to_bond(u_cb, u_ab)
 
-        return ModSemMaths.unit_vector_n(u_n, u_ab)
+        return ModSemMaths.unit_vector_normal_to_bond(u_n, u_ab)
 
     @staticmethod
     def dot_product(u_pa, eig_ab):
@@ -56,10 +60,11 @@ class ModSemMaths:
     def force_constant_bond(bond, eigenvals, eigenvecs, coords):
         """Force Constant - Equation 10 of Seminario paper - gives force constant for bond."""
 
-        eigenvals_ab = eigenvals[bond[0], bond[1], :]
-        eigenvecs_ab = eigenvecs[:, :, bond[0], bond[1]]
+        atom_a, atom_b = bond
+        eigenvals_ab = eigenvals[atom_a, atom_b, :]
+        eigenvecs_ab = eigenvecs[:, :, atom_a, atom_b]
 
-        unit_vectors_ab = ModSemMaths.vector_along_bond(coords, bond)
+        unit_vectors_ab = ModSemMaths.unit_vector_along_bond(coords, bond)
 
         return -0.5 * sum(eigenvals_ab[i] * abs(np.dot(unit_vectors_ab, eigenvecs_ab[:, i])) for i in range(3))
 
@@ -72,8 +77,8 @@ class ModSemMaths:
 
         atom_a, atom_b, atom_c = angle
 
-        u_ab = ModSemMaths.vector_along_bond(coords, (atom_a, atom_b))
-        u_cb = ModSemMaths.vector_along_bond(coords, (atom_c, atom_b))
+        u_ab = ModSemMaths.unit_vector_along_bond(coords, (atom_a, atom_b))
+        u_cb = ModSemMaths.unit_vector_along_bond(coords, (atom_c, atom_b))
 
         bond_len_ab = bond_lens[atom_a, atom_b]
         eigenvals_ab = eigenvals[atom_a, atom_b, :]
@@ -84,16 +89,17 @@ class ModSemMaths:
         eigenvecs_cb = eigenvecs[:3, :3, atom_c, atom_b]
 
         # Normal vector to angle plane found
-        u_n = ModSemMaths.unit_vector_n(u_cb, u_ab)
+        u_n = ModSemMaths.unit_vector_normal_to_bond(u_cb, u_ab)
 
-        if abs(sum(u_cb - u_ab)) < 0.01 or (1.99 < abs(sum(u_cb - u_ab)) < 2.01):
+        # Angle is linear:
+        if abs(np.linalg.norm(u_cb - u_ab)) < 0.01 or (1.99 < abs(np.linalg.norm(u_cb - u_ab)) < 2.01):
             # Scalings are set to 1.
             k_theta, theta_0 = ModSemMaths.f_c_a_special_case(
                 u_ab, u_cb, [bond_len_ab, bond_len_bc], [eigenvals_ab, eigenvals_cb], [eigenvecs_ab, eigenvecs_cb])
 
         else:
-            u_pa = ModSemMaths.unit_vector_n(u_n, u_ab)
-            u_pc = ModSemMaths.unit_vector_n(u_cb, u_n)
+            u_pa = ModSemMaths.unit_vector_normal_to_bond(u_n, u_ab)
+            u_pc = ModSemMaths.unit_vector_normal_to_bond(u_cb, u_n)
 
             # Scaling due to additional angles - Modified Seminario Part
             sum_first = sum(eigenvals_ab[i] * abs(ModSemMaths.dot_product(u_pa, eigenvecs_ab[:, i])) for i in range(3)) / scalings[0]
@@ -127,8 +133,8 @@ class ModSemMaths:
 
             u_n = [np.sin(theta) * np.cos(theta), np.sin(theta) * np.sin(theta), np.cos(theta)]
 
-            u_pa = ModSemMaths.unit_vector_n(u_n, u_ab)
-            u_pc = ModSemMaths.unit_vector_n(u_cb, u_n)
+            u_pa = ModSemMaths.unit_vector_normal_to_bond(u_n, u_ab)
+            u_pc = ModSemMaths.unit_vector_normal_to_bond(u_cb, u_n)
 
             sum_first = sum(eigenvals[0][i] * abs(ModSemMaths.dot_product(u_pa, eigenvecs[0][:, i])) for i in range(3))
             sum_second = sum(eigenvals[1][i] * abs(ModSemMaths.dot_product(u_pc, eigenvecs[1][:, i])) for i in range(3))
@@ -181,7 +187,9 @@ class ModSeminario:
         self.calculate_angles(eigenvals, eigenvecs)
 
     def calculate_angles(self, eigenvals, eigenvecs):
-        """Uses the modified Seminario method to find the angle parameters and prints them to file."""
+        """
+        Uses the modified Seminario method to find the angle parameters and prints them to file.
+        """
 
         # A structure is created with the index giving the central atom of the angle;
         # an array then lists the angles with that central atom.
@@ -254,8 +262,6 @@ class ModSeminario:
             for j in range(len(central_atoms_angles[i])):
                 scaling_factors_angles_list[scaling_factor_all_angles[i][j][1]].append(scaling_factor_all_angles[i][j][0])
 
-        # Used to find average values
-        unique_values_angles = []
         k_theta, theta_0 = np.zeros(len(self.molecule.angles)), np.zeros(len(self.molecule.angles))
 
         conversion = constants.KCAL_TO_KJ * 2
@@ -280,22 +286,15 @@ class ModSeminario:
                 # Add ModSem values to ligand object.
                 self.molecule.HarmonicAngleForce[angle] = [theta_0[i] * constants.DEG_TO_RAD, k_theta[i] * conversion]
 
-                unique_values_angles.append(
-                    [self.molecule.atoms[angle[0]].atom_name, self.molecule.atoms[angle[1]].atom_name, self.molecule.atoms[angle[2]].atom_name,
-                     k_theta[i] * conversion, theta_0[i] * constants.DEG_TO_RAD, 1])
-
-        return unique_values_angles
-
     def calculate_bonds(self, eigenvals, eigenvecs):
-        """Uses the modified Seminario method to find the bond parameters and print them to file."""
+        """
+        Uses the modified Seminario method to find the bond parameters and print them to file.
+        """
 
         bonds = self.molecule.topology.edges
         conversion = constants.KCAL_TO_KJ * 200
 
         k_b, bond_len_list = np.zeros(len(bonds)), np.zeros(len(bonds))
-
-        # Used to find average values
-        unique_values_bonds = []
 
         with open('Modified_Seminario_Bonds.txt', f'{"w" if self.molecule.restart else "a+"}') as bond_file:
 
@@ -313,8 +312,32 @@ class ModSeminario:
                 # Add ModSem values to ligand object.
                 self.molecule.HarmonicBondForce[bond] = [bond_len_list[pos] / 10, conversion * k_b[pos]]
 
-                unique_values_bonds.append(
-                    [self.molecule.atoms[bond[0]].atom_name, self.molecule.atoms[bond[1]].atom_name,
-                     k_b[pos] * conversion, bond_len_list[pos] / 10, 1])
+    def symmetrise_bonded_parameters(self):
+        """
+        Apply symmetry to the bonded parameters stored in the molecule based on types from rdkit.
+        """
 
-        return unique_values_bonds
+        if (self.molecule.bond_types is None) or (not self.molecule.symmetry):
+            return
+
+        # Collect all of the bond values from the HarmonicBondForce dict
+        for bonds in self.molecule.bond_types.values():
+            bond_lens, bond_forces = zip(*[self.molecule.HarmonicBondForce[bond] for bond in bonds])
+
+            # Average
+            bond_lens, bond_forces = sum(bond_lens) / len(bond_lens), sum(bond_forces) / len(bond_forces)
+
+            # Replace with averaged values
+            for bond in bonds:
+                self.molecule.HarmonicBondForce[bond] = [bond_lens, bond_forces]
+
+        # Collect all of the angle values from the HarmonicAngleForce dict
+        for angles in self.molecule.angle_types.values():
+            angle_vals, angle_forces = zip(*[self.molecule.HarmonicAngleForce[angle] for angle in angles])
+
+            # Average
+            angle_vals, angle_forces = sum(angle_vals) / len(angle_vals), sum(angle_forces) / len(angle_forces)
+
+            # Replace with averaged values
+            for angle in angles:
+                self.molecule.HarmonicAngleForce[angle] = [angle_vals, angle_forces]

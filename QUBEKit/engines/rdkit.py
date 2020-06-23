@@ -5,31 +5,39 @@ from QUBEKit.utils.decorators import for_all_methods, timer_logger
 import numpy as np
 
 from rdkit import Chem
-from rdkit.Geometry.rdGeometry import Point3D
 from rdkit.Chem import AllChem, Descriptors
-from rdkit.Chem.rdchem import GetPeriodicTable
 from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule, UFFOptimizeMolecule
+from rdkit.Geometry.rdGeometry import Point3D
 
 
 @for_all_methods(timer_logger)
 class RDKit:
     """Class for controlling useful RDKit functions."""
-    def __init__(self):
-        pass
 
-    def read_file(self, filename):
+    @staticmethod
+    def mol_input_to_rdkit_mol(mol_input, name=None):
+        """
+        :param mol_input: pathlib.Path of the filename provided or the smiles string
+        :param name:
+        :return: RDKit molecule object generated from its file (or None if incorrect file type is provided).
+        """
 
-        # Try to read the file
-        if filename.suffix == '.pdb':
-            return Chem.MolFromPDBFile(filename.name, removeHs=False)
-        elif filename.suffix == '.mol2':
-            return Chem.MolFromMol2File(filename.name, removeHs=False)
-        elif filename.suffix == '.mol':
-            return Chem.MolFromMolFile(filename.name, removeHs=False)
-        else:
-            return None
+        # Interpret the smiles string
+        if isinstance(mol_input, str):
+            return RDKit.smiles_to_rdkit_mol(mol_input, name)
 
-    def smiles_to_rdkit_mol(self, smiles_string, name=None):
+        # Read the file
+        if mol_input.suffix == '.pdb':
+            return Chem.MolFromPDBFile(mol_input.name, removeHs=False)
+        elif mol_input.suffix == '.mol2':
+            return Chem.MolFromMol2File(mol_input.name, removeHs=False)
+        elif mol_input.suffix == '.mol':
+            return Chem.MolFromMolFile(mol_input.name, removeHs=False)
+
+        return None
+
+    @staticmethod
+    def smiles_to_rdkit_mol(smiles_string, name=None):
         """
         Converts smiles strings to RDKit mol object.
         :param smiles_string: The hydrogen free smiles string
@@ -47,16 +55,17 @@ class RDKit:
 
         return mol_hydrogens
 
-    def mm_optimise(self, filename, ff='MMF'):
+    @staticmethod
+    def mm_optimise(filename, ff='MMF'):
         """
         Perform rough preliminary optimisation to speed up later optimisations.
-        :param filename: The name of the input file
+        :param filename: The Path of the input file
         :param ff: The Force field to be used either MMF or UFF
         :return: The name of the optimised pdb file that is made
         """
 
         # Get the rdkit molecule
-        mol = RDKit().read_file(filename)
+        mol = RDKit.mol_input_to_rdkit_mol(filename)
 
         {'MMF': MMFFOptimizeMolecule, 'UFF': UFFOptimizeMolecule}[ff](mol)
 
@@ -64,7 +73,8 @@ class RDKit:
 
         return f'{filename.stem}_rdkit_optimised.pdb'
 
-    def rdkit_descriptors(self, rdkit_mol):
+    @staticmethod
+    def rdkit_descriptors(rdkit_mol):
         """
         Use RDKit Descriptors to extract properties and store in Descriptors dictionary.
         :param rdkit_mol: The molecule input file
@@ -80,43 +90,47 @@ class RDKit:
             'LogP': Descriptors.MolLogP(rdkit_mol)
         }
 
-    def get_smiles(self, filename):
+    @staticmethod
+    def get_smiles(filename):
         """
         Use RDKit to load in the pdb file of the molecule and get the smiles code.
         :param filename: The molecule input file
         :return: The smiles string
         """
 
-        mol = RDKit().read_file(filename)
+        rdkit_mol = RDKit.mol_input_to_rdkit_mol(filename)
 
-        return Chem.MolToSmiles(mol, isomericSmiles=True, allHsExplicit=True)
+        return Chem.MolToSmiles(rdkit_mol, isomericSmiles=True, allHsExplicit=True)
 
-    def get_smarts(self, filename):
+    @staticmethod
+    def get_smarts(filename):
         """
         Use RDKit to get the smarts string of the molecule.
         :param filename: The molecule input file
         :return: The smarts string
         """
 
-        mol = RDKit().read_file(filename)
+        mol = RDKit.mol_input_to_rdkit_mol(filename)
 
         return Chem.MolToSmarts(mol)
 
-    def get_mol(self, filename):
+    @staticmethod
+    def get_mol(filename):
         """
         Use RDKit to generate a mol file.
         :param filename: The molecule input file
         :return: The name of the mol file made
         """
 
-        mol = RDKit().read_file(filename)
+        mol = RDKit.mol_input_to_rdkit_mol(filename)
 
         mol_name = f'{filename.stem}.mol'
         Chem.MolToMolFile(mol, mol_name)
 
         return mol_name
 
-    def generate_conformers(self, rdkit_mol, conformer_no=10):
+    @staticmethod
+    def generate_conformers(rdkit_mol, conformer_no=10):
         """
         Generate a set of x conformers of the molecule
         :param conformer_no: The amount of conformers made for the molecule
@@ -124,27 +138,28 @@ class RDKit:
         :return: A list of conformer position arrays
         """
 
-        cons = AllChem.EmbedMultipleConfs(rdkit_mol, numConfs=conformer_no)
-        positions = cons.GetConformers()
+        AllChem.EmbedMultipleConfs(rdkit_mol, numConfs=conformer_no)
+        positions = rdkit_mol.GetConformers()
 
         return [conformer.GetPositions() for conformer in positions]
 
-    def find_symmetry_classes(self, mol):
+    @staticmethod
+    def find_symmetry_classes(rdkit_mol):
         """
         Generate list of tuples of symmetry-equivalent (homotopic) atoms in the molecular graph
         based on: https://sourceforge.net/p/rdkit/mailman/message/27897393/
         Our thanks to Dr Michal Krompiec for the symmetrisation method and its implementation.
-        :param mol: molecule to find symmetry classes for (rdkit mol class object)
+        :param rdkit_mol: molecule to find symmetry classes for (rdkit mol class object)
         :return: A dict where the keys are the atom indices and the values are their type
         (type is arbitrarily based on index; only consistency is needed, no specific values)
         """
 
         # Check CIPRank is present for first atom (can assume it is present for all afterwards)
-        if not mol.GetAtomWithIdx(0).HasProp('_CIPRank'):
-            Chem.AssignStereochemistry(mol, cleanIt=True, force=True, flagPossibleStereoCenters=True)
+        if not rdkit_mol.GetAtomWithIdx(0).HasProp('_CIPRank'):
+            Chem.AssignStereochemistry(rdkit_mol, cleanIt=True, force=True, flagPossibleStereoCenters=True)
 
         # Array of ranks showing matching atoms
-        cip_ranks = np.array([int(atom.GetProp('_CIPRank')) for atom in mol.GetAtoms()])
+        cip_ranks = np.array([int(atom.GetProp('_CIPRank')) for atom in rdkit_mol.GetAtoms()])
 
         # Map the ranks to the atoms to produce a list of symmetrical atoms
         atom_symmetry_classes = [np.where(cip_ranks == rank)[0].tolist() for rank in range(max(cip_ranks) + 1)]
@@ -158,22 +173,24 @@ class RDKit:
 
         return atom_symmetry_classes_dict
 
-    def get_conformer_rmsd(self, mol, ref_index, align_index):
+    @staticmethod
+    def get_conformer_rmsd(rdkit_mol, ref_index, align_index):
         """
         Get the rmsd between the current rdkit molecule and the coordinates provided
-        :param mol: rdkit representation of the molecule, conformer 0 is the base
+        :param rdkit_mol: rdkit representation of the molecule, conformer 0 is the base
         :param ref_index: the conformer index of the refernce
         :param align_index: the conformer index which should be aligned
         :return: the rmsd value
         """
 
-        return Chem.AllChem.GetConformerRMS(mol, ref_index, align_index)
+        return Chem.AllChem.GetConformerRMS(rdkit_mol, ref_index, align_index)
 
-    def add_conformer(self, mol, conformer_coordinates):
+    @staticmethod
+    def add_conformer(rdkit_mol, conformer_coordinates):
         """
         Add a new conformation to the rdkit molecule
         :param conformer_coordinates:  A numpy array of the coordinates to be added
-        :param mol: The rdkit molecule instance
+        :param rdkit_mol: The rdkit molecule instance
         :return: The rdkit molecule with the conformer added
         """
 
@@ -182,23 +199,6 @@ class RDKit:
             atom_position = Point3D(*coord)
             conformer.SetAtomPosition(i, atom_position)
 
-        mol.AddConformer(conformer, assignId=True)
+        rdkit_mol.AddConformer(conformer, assignId=True)
 
-        return mol
-
-
-class Element:
-    """
-    Simple wrapper class for getting element info using RDKit.
-    """
-
-    pt = GetPeriodicTable()
-
-    def mass(self, identifier):
-        return self.pt.GetAtomicWeight(identifier)
-
-    def number(self, identifier):
-        return self.pt.GetAtomicNumber(identifier)
-
-    def name(self, identifier):
-        return self.pt.GetElementSymbol(identifier)
+        return rdkit_mol
